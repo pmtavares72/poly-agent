@@ -9,6 +9,7 @@ polyagent.db
 backtest.db
 markets_cache.json
 /logs/
+/data/
 
 # Next.js
 frontend/.next/

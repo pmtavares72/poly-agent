@@ -34,6 +34,7 @@ python agent.py --min-prob 0.93 --max-prob 0.99
 
 import argparse
 import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
@@ -73,7 +74,7 @@ console = Console()
 # BASE DE DATOS
 # ─────────────────────────────────────────────
 
-def init_db(db_path: str = "polyagent.db") -> sqlite3.Connection:
+def init_db(db_path: str = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.db")) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.executescript("""

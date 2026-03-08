@@ -21,7 +21,7 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-DB_PATH = "polyagent.db"
+DB_PATH = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.db")
 AGENT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.py")
 
 app = FastAPI(

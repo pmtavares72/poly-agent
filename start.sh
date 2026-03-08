@@ -10,6 +10,11 @@ cd "$SCRIPT_DIR"
 LOG_DIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
+# Directorio de datos persistente (volumen Docker en OpenClaw, local fallback)
+DATA_DIR="${POLYAGENT_DATA_DIR:-$SCRIPT_DIR/data}"
+mkdir -p "$DATA_DIR"
+export POLYAGENT_DB="$DATA_DIR/polyagent.db"
+
 echo "======================================"
 echo "  PolyAgent — Starting up"
 echo "  $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
