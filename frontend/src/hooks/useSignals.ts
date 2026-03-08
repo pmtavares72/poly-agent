@@ -1,0 +1,20 @@
+'use client'
+import useSWR from 'swr'
+import { fetchSignals, fetchOpenSignals } from '@/lib/api'
+
+export function useSignals(params?: { status?: string; limit?: number; offset?: number }) {
+  const key = `/signals?${JSON.stringify(params ?? {})}`
+  const { data, error, isLoading } = useSWR(key, () => fetchSignals(params), {
+    refreshInterval: 30_000,
+    revalidateOnFocus: true,
+  })
+  return { signals: data, error, isLoading }
+}
+
+export function useOpenSignals() {
+  const { data, error, isLoading } = useSWR('/signals/open', fetchOpenSignals, {
+    refreshInterval: 30_000,
+    revalidateOnFocus: true,
+  })
+  return { signals: data, error, isLoading }
+}
