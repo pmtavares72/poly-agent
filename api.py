@@ -63,9 +63,10 @@ class ConfigUpdate(BaseModel):
     min_profit_net:     Optional[float] = None
     max_hours_to_close: Optional[float] = None
     min_liquidity_usdc: Optional[float] = None
-    kelly_fraction:     Optional[float] = None
-    max_position_pct:   Optional[float] = None
-    fee_rate:           Optional[float] = None
+    kelly_fraction:              Optional[float] = None
+    max_position_pct:            Optional[float] = None
+    max_capital_deployed_pct:    Optional[float] = None
+    fee_rate:                    Optional[float] = None
     scan_interval_min:  Optional[int]   = None
 
 

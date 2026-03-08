@@ -67,6 +67,7 @@ export interface BotConfig {
   min_liquidity_usdc: number
   kelly_fraction: number
   max_position_pct: number
+  max_capital_deployed_pct: number
   fee_rate: number
   scan_interval_min: number
   updated_at: string | null

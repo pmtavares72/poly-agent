@@ -18,9 +18,10 @@ const PARAM_META: {
   { key: 'min_profit_net',     label: 'MIN_PROFIT_NET',     hint: 'Min net profit after fees (%)', step: '0.001' },
   { key: 'max_hours_to_close', label: 'MAX_HOURS_TO_CLOSE', hint: 'Max hours until market close',  step: '1' },
   { key: 'min_liquidity_usdc', label: 'MIN_LIQUIDITY_USDC', hint: 'Min market liquidity ($)',      step: '100', min: '0' },
-  { key: 'kelly_fraction',     label: 'KELLY_FRACTION',     hint: 'Conservative Kelly multiplier', step: '0.05', min: '0', max: '1' },
-  { key: 'max_position_pct',   label: 'MAX_POSITION_PCT',   hint: 'Max % of capital per trade',    step: '0.01', min: '0', max: '1' },
-  { key: 'fee_rate',           label: 'FEE_RATE',           hint: 'Protocol fee estimate',         step: '0.001', min: '0', max: '1' },
+  { key: 'kelly_fraction',              label: 'KELLY_FRACTION',              hint: 'Conservative Kelly multiplier',         step: '0.05',  min: '0', max: '1' },
+  { key: 'max_position_pct',            label: 'MAX_POSITION_PCT',            hint: 'Max % of capital per single trade',     step: '0.01',  min: '0', max: '1' },
+  { key: 'max_capital_deployed_pct',    label: 'MAX_CAPITAL_DEPLOYED_PCT',    hint: 'Max % of capital in open positions',    step: '0.05',  min: '0', max: '1' },
+  { key: 'fee_rate',                    label: 'FEE_RATE',                    hint: 'Protocol fee estimate',                 step: '0.001', min: '0', max: '1' },
 ]
 
 interface BondHunterCardProps {

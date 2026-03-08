@@ -134,6 +134,7 @@ def init_db(db_path: str = "polyagent.db") -> sqlite3.Connection:
             min_liquidity_usdc  REAL    DEFAULT 500.0,
             kelly_fraction      REAL    DEFAULT 0.25,
             max_position_pct    REAL    DEFAULT 0.15,
+            max_capital_deployed_pct REAL DEFAULT 0.50,
             fee_rate            REAL    DEFAULT 0.005,
             scan_interval_min   INTEGER DEFAULT 15,
             updated_at          TEXT
@@ -1060,9 +1061,10 @@ def run_paper(params: dict):
     max_hours        = params["max_hours"]
     min_liquidity    = params["min_liquidity"]
     fee_rate         = params["fee_rate"]
-    capital          = params["initial_capital"]
-    kelly_fraction   = params["kelly_fraction"]
-    max_position_pct = params["max_position_pct"]
+    capital                  = params["initial_capital"]
+    kelly_fraction           = params["kelly_fraction"]
+    max_position_pct         = params["max_position_pct"]
+    max_capital_deployed_pct = params.get("max_capital_deployed_pct", 0.50)
 
     import time as _time
     scan_start = _time.time()
@@ -1082,21 +1084,28 @@ def run_paper(params: dict):
     # Primero resolver señales anteriores pendientes
     resolved_count = resolve_pending_signals(conn)
 
-    # Capital disponible = initial_capital - capital ya comprometido en señales abiertas
+    # Capital comprometido en señales abiertas
     cur_cap = conn.cursor()
     cur_cap.execute("SELECT COALESCE(SUM(position_usdc),0), COUNT(*) FROM signals WHERE status='open'")
     committed_usdc, open_count = cur_cap.fetchone()
-    available_capital = max(0.0, capital - committed_usdc)
+    max_deployable = capital * max_capital_deployed_pct
+    available_capital = max(0.0, max_deployable - committed_usdc)
+    deployed_pct = (committed_usdc / capital * 100) if capital > 0 else 0
 
-    MAX_OPEN_SIGNALS = 10  # máximo de posiciones abiertas simultáneas
-
-    if open_count >= MAX_OPEN_SIGNALS:
-        console.print(f"\n[yellow]⚠ {open_count} señales abiertas (límite={MAX_OPEN_SIGNALS}). No se abren nuevas posiciones.[/yellow]\n")
-        new_signals = 0
+    if committed_usdc >= max_deployable:
+        console.print(
+            f"\n[yellow]⚠ Capital desplegado ${committed_usdc:.2f} "
+            f"({deployed_pct:.0f}%) ≥ límite {max_capital_deployed_pct*100:.0f}% "
+            f"del capital. No se abren nuevas posiciones.[/yellow]\n"
+        )
         markets = []
     else:
         console.print(f"\n[cyan]Escaneando mercados abiertos en busca de señales...[/cyan]\n")
-        console.print(f"[cyan]  Capital disponible: ${available_capital:.2f} (${committed_usdc:.2f} comprometido en {open_count} señales)[/cyan]\n")
+        console.print(
+            f"[cyan]  Capital: ${capital:.2f} · Desplegado: ${committed_usdc:.2f} "
+            f"({deployed_pct:.0f}%) · Disponible: ${available_capital:.2f} "
+            f"(límite {max_capital_deployed_pct*100:.0f}%)[/cyan]\n"
+        )
         markets = fetch_open_markets(min_liquidity)
         console.print(f"[cyan]  {len(markets)} mercados activos encontrados[/cyan]\n")
 
@@ -1162,8 +1171,8 @@ def run_paper(params: dict):
         if cur.fetchone():
             continue  # ya registrada
 
-        # Respetar límite de posiciones abiertas simultáneas
-        if open_count + new_signals >= MAX_OPEN_SIGNALS:
+        # Respetar límite de capital desplegado
+        if available_capital < 5.0:
             break
 
         # Spread y profit
@@ -1307,9 +1316,10 @@ def load_config_from_db(conn: sqlite3.Connection) -> dict:
         "min_profit_net":   cfg["min_profit_net"],
         "max_hours":        cfg["max_hours_to_close"],
         "min_liquidity":    cfg["min_liquidity_usdc"],
-        "kelly_fraction":   cfg["kelly_fraction"],
-        "max_position_pct": cfg["max_position_pct"],
-        "fee_rate":         cfg["fee_rate"],
+        "kelly_fraction":            cfg["kelly_fraction"],
+        "max_position_pct":          cfg["max_position_pct"],
+        "max_capital_deployed_pct":  cfg.get("max_capital_deployed_pct", 0.50),
+        "fee_rate":                  cfg["fee_rate"],
     }
 
 
