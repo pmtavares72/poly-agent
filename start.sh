@@ -52,11 +52,8 @@ echo ""
 echo "[4/5] Building & starting Next.js frontend..."
 cd frontend
 
-# Detectar IP pública del servidor para que el móvil/red externa pueda acceder a la API
+# Detectar IP para mostrar en el resumen (el proxy de Next.js hace que no sea necesaria para la API)
 SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || curl -s ifconfig.me 2>/dev/null || echo "localhost")
-echo "      Server IP detected: $SERVER_IP"
-echo "NEXT_PUBLIC_API_URL=http://${SERVER_IP}:8765" > .env.local
-echo "      ✓ .env.local configured (API URL: http://${SERVER_IP}:8765)"
 
 npm install -q
 npm run build -q
@@ -67,7 +64,7 @@ nohup npm start -- --port 3000 \
 FRONT_PID=$!
 cd "$SCRIPT_DIR"
 echo "      ✓ Frontend started (pid=$FRONT_PID)"
-echo "        App: http://localhost:3000"
+echo "        App: http://${SERVER_IP}:3000"
 
 # ── 5. Configurar cron ─────────────────────
 echo ""

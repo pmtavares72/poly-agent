@@ -1,6 +1,6 @@
 import type { Stats, SignalsResponse, Signal, Run, BotConfig, BotStatus, ScanLogsResponse } from '@/types'
 
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8765'
+const BASE = '/api'
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`)
