@@ -1,0 +1,6 @@
+requests
+pandas
+rich
+fastapi
+uvicorn[standard]
+pydantic
