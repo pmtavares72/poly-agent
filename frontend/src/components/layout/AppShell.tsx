@@ -8,12 +8,12 @@ import { Topbar } from './Topbar'
 import { TickerTape } from './TickerTape'
 import { timeAgo } from '@/lib/format'
 
-type Page = 'dashboard' | 'strategies'
+type Page = 'dashboard' | 'strategies' | 'logs'
 
 interface AppShellProps {
   children: React.ReactNode
   activePage: Page
-  title: string
+  title?: string
 }
 
 export function AppShell({ children, activePage, title }: AppShellProps) {
@@ -40,7 +40,7 @@ export function AppShell({ children, activePage, title }: AppShellProps) {
         <Sidebar activePage={activePage} openSignals={stats?.open ?? 0} />
 
         <div className="main-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-          <Topbar title={title} capital={capital} lastScan={lastScan} />
+          <Topbar title={title ?? ''} capital={capital} lastScan={lastScan} />
           <div style={{ padding: 28, flex: 1 }}>
             {children}
           </div>

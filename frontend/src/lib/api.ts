@@ -1,4 +1,4 @@
-import type { Stats, SignalsResponse, Signal, Run, BotConfig, BotStatus } from '@/types'
+import type { Stats, SignalsResponse, Signal, Run, BotConfig, BotStatus, ScanLogsResponse } from '@/types'
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8765'
 
@@ -40,6 +40,10 @@ export const fetchSignal          = (id: number) => get<Signal>(`/signals/${id}`
 // Runs
 export const fetchRuns = () => get<{ total: number; data: Run[] }>('/runs')
 export const fetchRun  = (id: number) => get<Run>(`/runs/${id}`)
+
+// Scan logs
+export const fetchScanLogs = (limit = 50) =>
+  get<ScanLogsResponse>(`/scan-logs?limit=${limit}`)
 
 // Config
 export const fetchConfig  = () => get<BotConfig>('/config')

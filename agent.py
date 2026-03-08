@@ -152,6 +152,24 @@ def init_db(db_path: str = "polyagent.db") -> sqlite3.Connection:
         );
         INSERT OR IGNORE INTO bot_status (id) VALUES (1);
 
+        -- Log de cada ejecución del scanner (paper trading)
+        CREATE TABLE IF NOT EXISTS scan_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at      TEXT NOT NULL,
+            finished_at     TEXT,
+            duration_sec    REAL,
+            markets_fetched INTEGER DEFAULT 0,
+            markets_checked INTEGER DEFAULT 0,
+            signals_found   INTEGER DEFAULT 0,
+            signals_resolved INTEGER DEFAULT 0,
+            skipped_wash    INTEGER DEFAULT 0,
+            skipped_spread  INTEGER DEFAULT 0,
+            skipped_no_data INTEGER DEFAULT 0,
+            skipped_price   INTEGER DEFAULT 0,
+            error           TEXT,
+            mode            TEXT DEFAULT 'paper'
+        );
+
         -- Señales paper trading: mercados abiertos detectados en tiempo real
         CREATE TABLE IF NOT EXISTS signals (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -936,16 +954,18 @@ def fetch_open_markets(min_liquidity: float) -> list:
     return markets
 
 
-def resolve_pending_signals(conn: sqlite3.Connection):
+def resolve_pending_signals(conn: sqlite3.Connection) -> int:
     """
     Para cada señal en estado 'open' cuyo closes_at ya pasó,
     consulta la Gamma API para obtener el outcome real y actualiza el registro.
+    Devuelve el número de señales resueltas.
     """
     cur = conn.cursor()
     cur.execute("SELECT id, token_id, question, closes_at, position_usdc, shares, protocol_fee FROM signals WHERE status='open'")
     pending = cur.fetchall()
     if not pending:
-        return
+        return 0
+    resolved_count = 0
 
     now = datetime.now(timezone.utc)
     console.print(f"\n[cyan]Revisando {len(pending)} señales pendientes de resolución...[/cyan]")
@@ -1018,7 +1038,10 @@ def resolve_pending_signals(conn: sqlite3.Connection):
             WHERE id=?
         """, (outcome, now.isoformat(), pnl, pnl_pct, sig_id))
         conn.commit()
+        resolved_count += 1
         time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    return resolved_count
 
 
 def run_paper(params: dict):
@@ -1037,17 +1060,34 @@ def run_paper(params: dict):
     kelly_fraction   = params["kelly_fraction"]
     max_position_pct = params["max_position_pct"]
 
+    import time as _time
+    scan_start = _time.time()
+
     conn = init_db()
 
+    # Insertar registro de scan en curso
+    scan_started_at = datetime.now(timezone.utc).isoformat()
+    cur_log = conn.cursor()
+    cur_log.execute(
+        "INSERT INTO scan_log (started_at, mode) VALUES (?, 'paper')",
+        (scan_started_at,)
+    )
+    conn.commit()
+    scan_log_id = cur_log.lastrowid
+
     # Primero resolver señales anteriores pendientes
-    resolve_pending_signals(conn)
+    resolved_count = resolve_pending_signals(conn)
 
     console.print(f"\n[cyan]Escaneando mercados abiertos en busca de señales...[/cyan]\n")
     markets = fetch_open_markets(min_liquidity)
     console.print(f"[cyan]  {len(markets)} mercados activos encontrados[/cyan]\n")
 
     new_signals = 0
-    skipped = 0
+    markets_checked = 0
+    skipped_wash = 0
+    skipped_spread = 0
+    skipped_no_data = 0
+    skipped_price = 0
 
     for m in markets:
         question = m.get("question", m.get("title", "Unknown"))
@@ -1059,10 +1099,12 @@ def run_paper(params: dict):
 
         token_id_yes = token_or_reason
 
+        markets_checked += 1
+
         # Anti-wash
         is_wash, _ = compute_wash_score(m)
         if is_wash:
-            skipped += 1
+            skipped_wash += 1
             continue
 
         # Fechas — mercado debe cerrar dentro de max_hours
@@ -1083,7 +1125,7 @@ def run_paper(params: dict):
         start_ts = now_ts - 600
         history = fetch_price_series(token_id_yes, start_ts, now_ts)
         if not history:
-            skipped += 1
+            skipped_no_data += 1
             continue
 
         # Precio más reciente
@@ -1093,6 +1135,7 @@ def run_paper(params: dict):
             continue
 
         if not (min_prob <= current_price <= max_prob):
+            skipped_price += 1
             continue
 
         # Comprobar que esta señal no existe ya (mismo token_id + aún abierta)
@@ -1113,7 +1156,7 @@ def run_paper(params: dict):
         net_profit_pct = (1.0 - ask_price) - fee_rate
 
         if net_profit_pct < min_profit_net:
-            skipped += 1
+            skipped_spread += 1
             continue
 
         # Kelly sizing
@@ -1152,14 +1195,39 @@ def run_paper(params: dict):
             f"net=[green]+{net_profit_pct*100:.2f}%[/green]"
         )
 
+    # Guardar scan_log completo
+    finished_at = datetime.now(timezone.utc).isoformat()
+    duration_sec = round(_time.time() - scan_start, 1)
+    conn.execute("""
+        UPDATE scan_log SET
+            finished_at=?, duration_sec=?,
+            markets_fetched=?, markets_checked=?,
+            signals_found=?, signals_resolved=?,
+            skipped_wash=?, skipped_spread=?,
+            skipped_no_data=?, skipped_price=?
+        WHERE id=?
+    """, (
+        finished_at, duration_sec,
+        len(markets), markets_checked,
+        new_signals, resolved_count,
+        skipped_wash, skipped_spread,
+        skipped_no_data, skipped_price,
+        scan_log_id,
+    ))
+    conn.commit()
     conn.close()
 
     console.print(f"\n[bold]Paper trading scan completo.[/bold]")
-    console.print(f"  Señales nuevas detectadas: [green]{new_signals}[/green]")
-    console.print(f"  Descartadas:               [dim]{skipped}[/dim]")
+    console.print(f"  Mercados descargados:      [cyan]{len(markets)}[/cyan]")
+    console.print(f"  Mercados analizados:       [cyan]{markets_checked}[/cyan]")
+    console.print(f"  Señales nuevas:            [green]{new_signals}[/green]")
+    console.print(f"  Señales resueltas:         [green]{resolved_count}[/green]")
+    console.print(f"  Descartados (wash):        [dim]{skipped_wash}[/dim]")
+    console.print(f"  Descartados (spread):      [dim]{skipped_spread}[/dim]")
+    console.print(f"  Sin datos CLOB:            [dim]{skipped_no_data}[/dim]")
+    console.print(f"  Precio fuera de rango:     [dim]{skipped_price}[/dim]")
+    console.print(f"  Duración:                  [dim]{duration_sec}s[/dim]")
     console.print(f"  Datos guardados en:        [bold]polyagent.db[/bold] → tabla [bold]signals[/bold]\n")
-    console.print("[dim]Ejecuta de nuevo en 15-30 min para resolver señales y detectar nuevas.[/dim]")
-    console.print("[dim]Usa la API (api.py) para ver los datos desde Next.js.[/dim]\n")
 
 
 # ─────────────────────────────────────────────

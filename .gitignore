@@ -8,7 +8,7 @@ __pycache__/
 polyagent.db
 backtest.db
 markets_cache.json
-logs/
+/logs/
 
 # Next.js
 frontend/.next/

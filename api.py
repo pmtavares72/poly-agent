@@ -326,6 +326,45 @@ def get_stats():
 
 
 # ─────────────────────────────────────────────
+# SCAN LOGS
+# ─────────────────────────────────────────────
+
+@app.get("/scan-logs")
+def get_scan_logs(limit: int = Query(50, le=200), offset: int = Query(0)):
+    """Historial de ejecuciones del scanner paper trading."""
+    conn = get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scan_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at      TEXT NOT NULL,
+            finished_at     TEXT,
+            duration_sec    REAL,
+            markets_fetched INTEGER DEFAULT 0,
+            markets_checked INTEGER DEFAULT 0,
+            signals_found   INTEGER DEFAULT 0,
+            signals_resolved INTEGER DEFAULT 0,
+            skipped_wash    INTEGER DEFAULT 0,
+            skipped_spread  INTEGER DEFAULT 0,
+            skipped_no_data INTEGER DEFAULT 0,
+            skipped_price   INTEGER DEFAULT 0,
+            error           TEXT,
+            mode            TEXT DEFAULT 'paper'
+        )
+    """)
+    conn.commit()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM scan_log ORDER BY id DESC LIMIT ? OFFSET ?",
+        (limit, offset)
+    )
+    data = rows(cur)
+    cur.execute("SELECT COUNT(*) FROM scan_log")
+    total = cur.fetchone()[0]
+    conn.close()
+    return {"total": total, "limit": limit, "offset": offset, "data": data}
+
+
+# ─────────────────────────────────────────────
 # RUNS (backtest)
 # ─────────────────────────────────────────────
 

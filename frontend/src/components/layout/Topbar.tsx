@@ -2,7 +2,7 @@
 import { formatUSDC } from '@/lib/format'
 
 interface TopbarProps {
-  title: string
+  title?: string
   capital: number
   lastScan?: string
 }

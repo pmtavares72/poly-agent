@@ -51,6 +51,13 @@ echo "        Swagger: http://localhost:8765/docs"
 echo ""
 echo "[4/5] Building & starting Next.js frontend..."
 cd frontend
+
+# Detectar IP pública del servidor para que el móvil/red externa pueda acceder a la API
+SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || curl -s ifconfig.me 2>/dev/null || echo "localhost")
+echo "      Server IP detected: $SERVER_IP"
+echo "NEXT_PUBLIC_API_URL=http://${SERVER_IP}:8765" > .env.local
+echo "      ✓ .env.local configured (API URL: http://${SERVER_IP}:8765)"
+
 npm install -q
 npm run build -q
 pkill -f "next start" 2>/dev/null || true
@@ -77,9 +84,9 @@ echo ""
 echo "======================================"
 echo "  ✓ PolyAgent running!"
 echo ""
-echo "  App:     http://localhost:3000"
-echo "  API:     http://localhost:8765"
-echo "  Docs:    http://localhost:8765/docs"
+echo "  App:     http://${SERVER_IP}:3000"
+echo "  API:     http://${SERVER_IP}:8765"
+echo "  Docs:    http://${SERVER_IP}:8765/docs"
 echo ""
 echo "  Logs:"
 echo "    API:      tail -f $LOG_DIR/api.log"

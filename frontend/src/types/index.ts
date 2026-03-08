@@ -83,6 +83,30 @@ export interface BotStatus {
   scan_count: number
 }
 
+export interface ScanLog {
+  id: number
+  started_at: string
+  finished_at: string | null
+  duration_sec: number | null
+  markets_fetched: number
+  markets_checked: number
+  signals_found: number
+  signals_resolved: number
+  skipped_wash: number
+  skipped_spread: number
+  skipped_no_data: number
+  skipped_price: number
+  error: string | null
+  mode: string
+}
+
+export interface ScanLogsResponse {
+  total: number
+  limit: number
+  offset: number
+  data: ScanLog[]
+}
+
 export interface Run {
   id: number
   started_at: string
