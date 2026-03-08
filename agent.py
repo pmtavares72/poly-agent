@@ -199,6 +199,18 @@ def init_db(db_path: str = "polyagent.db") -> sqlite3.Connection:
         );
     """)
     conn.commit()
+
+    # Migraciones: añadir columnas nuevas a tablas existentes sin perder datos
+    migrations = [
+        ("config", "max_capital_deployed_pct", "REAL DEFAULT 0.50"),
+    ]
+    for table, column, definition in migrations:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # columna ya existe
+
     return conn
 
 
