@@ -433,10 +433,12 @@ def fetch_resolved_markets(days_back: int) -> list:
 # PASO 2 — FILTROS BÁSICOS
 # ─────────────────────────────────────────────
 
-def passes_basic_filters(m: dict, min_liquidity: float) -> tuple:
+def passes_basic_filters(m: dict, min_liquidity: float, require_resolved: bool = True) -> tuple:
     """
     Devuelve (True, token_id_yes, outcome_winner) o (False, reason, None).
-    outcome_winner: 'YES' | 'NO'
+    outcome_winner: 'YES' | 'NO' | None (en paper trading, where market is still open)
+    require_resolved=True: exige outcomePrices=[1,0] o [0,1] (backtest)
+    require_resolved=False: acepta cualquier outcomePrices válido (paper)
     """
     # Solo binarios
     outcomes = m.get("outcomes") or []
@@ -449,7 +451,7 @@ def passes_basic_filters(m: dict, min_liquidity: float) -> tuple:
     if len(outcomes) != 2:
         return False, "not_binary", None
 
-    # outcomePrices debe ser [1.0, 0.0] o [0.0, 1.0]
+    # outcomePrices — en backtest debe ser [1,0] o [0,1]; en paper son precios actuales
     outcome_prices_raw = m.get("outcomePrices") or []
     if isinstance(outcome_prices_raw, str):
         try:
@@ -469,8 +471,10 @@ def passes_basic_filters(m: dict, min_liquidity: float) -> tuple:
         outcome_winner = "YES"
     elif op == [0.0, 1.0]:
         outcome_winner = "NO"
-    else:
+    elif require_resolved:
         return False, "disputed_resolution", None
+    else:
+        outcome_winner = None  # mercado abierto, resultado aún desconocido
 
     # Volumen
     volume = float(m.get("volume", 0) or 0)
@@ -1092,8 +1096,8 @@ def run_paper(params: dict):
     for m in markets:
         question = m.get("question", m.get("title", "Unknown"))
 
-        # Filtros básicos
-        ok, token_or_reason, _ = passes_basic_filters(m, min_liquidity)
+        # Filtros básicos (mercados abiertos: no exigir outcomePrices resuelto)
+        ok, token_or_reason, _ = passes_basic_filters(m, min_liquidity, require_resolved=False)
         if not ok:
             continue
 
