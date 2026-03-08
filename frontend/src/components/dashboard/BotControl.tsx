@@ -13,7 +13,10 @@ export function BotControl() {
   async function handleScanNow() {
     setScanMsg(null)
     const result = await triggerScan()
-    if (result) setScanMsg(result.message)
+    if (result) {
+      setScanMsg(result.message)
+      setTimeout(() => setScanMsg(null), 10_000)
+    }
   }
 
   return (
@@ -97,7 +100,7 @@ export function BotControl() {
           {enabled && (
             <button
               onClick={handleScanNow}
-              disabled={actionLoading || scanning}
+              disabled={actionLoading}
               style={{
                 padding: '8px 14px',
                 background: 'transparent',

@@ -12,10 +12,9 @@ interface SidebarProps {
 const navItems = [
   { id: 'dashboard',   href: '/dashboard',   icon: '◈', label: 'Dashboard',     section: 'monitor' },
   { id: 'strategies',  href: '/strategies',  icon: '⬡', label: 'Strategies',    section: 'monitor' },
-  { id: 'signals',     href: '/dashboard',   icon: '◎', label: 'Signals',       section: 'monitor', badge: true },
-  { id: 'history',     href: '/dashboard',   icon: '≡', label: 'Trade History', section: 'monitor' },
-  { id: 'settings',    href: '/dashboard',   icon: '⚙', label: 'Settings',      section: 'system' },
-  { id: 'apikeys',     href: '/dashboard',   icon: '⬡', label: 'API Keys',      section: 'system' },
+  { id: 'signals',     href: '/dashboard#signals', icon: '◎', label: 'Signals',       section: 'monitor', badge: true },
+  { id: 'history',     href: '/dashboard#history', icon: '≡', label: 'Trade History', section: 'monitor' },
+  { id: 'settings',    href: '/strategies',  icon: '⚙', label: 'Settings',      section: 'system' },
 ]
 
 export function Sidebar({ activePage, openSignals = 0 }: SidebarProps) {

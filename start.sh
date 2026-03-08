@@ -18,13 +18,14 @@ echo "======================================"
 # ── 1. Dependencias Python ──────────────────
 echo ""
 echo "[1/5] Checking Python dependencies..."
-pip install -r requirements.txt -q
+PYTHON_BIN=$(which python3 2>/dev/null || which python)
+$PYTHON_BIN -m pip install -r requirements.txt -q
 echo "      ✓ Python deps OK"
 
 # ── 2. Inicializar BD y config ─────────────
 echo ""
 echo "[2/5] Initializing database..."
-python agent.py --mode paper --force 2>/dev/null || true
+$PYTHON_BIN agent.py --mode paper --force 2>/dev/null || true
 # Nota: fuerza la creación de tablas aunque el bot esté disabled
 # El --force hace que ejecute aunque enabled=0
 echo "      ✓ Database initialized (polyagent.db)"
@@ -58,8 +59,6 @@ echo "        App: http://localhost:3000"
 # ── 5. Configurar cron ─────────────────────
 echo ""
 echo "[5/5] Configuring cron job (every 15 min)..."
-CRON_CMD="*/15 * * * * cd $SCRIPT_DIR && $PYTHON_BIN agent.py --mode paper >> $LOG_DIR/agent.log 2>&1"
-PYTHON_BIN=$(which python3 || which python)
 CRON_CMD="*/15 * * * * cd $SCRIPT_DIR && $PYTHON_BIN $SCRIPT_DIR/agent.py --mode paper >> $LOG_DIR/agent.log 2>&1"
 
 # Añadir solo si no existe ya

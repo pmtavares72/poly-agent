@@ -1179,6 +1179,7 @@ def parse_args() -> dict:
     parser.add_argument("--max-hours", type=float, default=MAX_HOURS_TO_CLOSE, help="Horas máx. al cierre")
     parser.add_argument("--min-liq",   type=float, default=MIN_LIQUIDITY_USDC, help="Liquidez mínima USDC")
     parser.add_argument("--fee-rate",  type=float, default=FEE_RATE,           help="Fee protocolo")
+    parser.add_argument("--force",     action="store_true",                    help="Forzar ejecución aunque bot esté disabled")
     args = parser.parse_args()
 
     return {
@@ -1193,6 +1194,7 @@ def parse_args() -> dict:
         "fee_rate":         args.fee_rate,
         "kelly_fraction":   KELLY_FRACTION,
         "max_position_pct": MAX_POSITION_PCT,
+        "force":            args.force,
     }
 
 
@@ -1244,7 +1246,7 @@ if __name__ == "__main__":
 
     if mode == "paper":
         # Verificar si el bot está habilitado (a menos que se fuerce con --force)
-        if not check_bot_enabled(conn_init) and "--force" not in __import__("sys").argv:
+        if not check_bot_enabled(conn_init) and not cli_params.get("force"):
             console.print("[yellow]Bot está PARADO (disabled en config). "
                           "Actívalo desde la app o usa --force para forzar.[/yellow]")
             conn_init.close()

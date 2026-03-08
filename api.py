@@ -138,8 +138,14 @@ def get_bot_status():
     if pid:
         try:
             os.kill(pid, 0)
-            status["pid_alive"] = True
-        except (ProcessLookupError, PermissionError):
+            # Check process is not a zombie (Z state)
+            result = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True, text=True
+            )
+            state = result.stdout.strip()
+            status["pid_alive"] = bool(state) and "Z" not in state
+        except (ProcessLookupError, PermissionError, OSError):
             status["pid_alive"] = False
     else:
         status["pid_alive"] = False
