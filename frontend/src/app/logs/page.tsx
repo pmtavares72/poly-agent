@@ -171,7 +171,7 @@ export default function LogsPage() {
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24 }}>
           <div>
-            <h1 style={{ fontSize: 20, fontWeight: 800, color: 'var(--text)', margin: 0, letterSpacing: '-0.02em' }}>
+            <h1 style={{ fontFamily: 'var(--mono)', fontSize: 16, fontWeight: 600, color: 'var(--text)', margin: 0, letterSpacing: '0.02em' }}>
               Scan History
             </h1>
             <p style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text3)', margin: '4px 0 0' }}>
@@ -206,7 +206,7 @@ export default function LogsPage() {
               <div style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text3)', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6 }}>
                 {label}
               </div>
-              <div style={{ fontSize: 20, fontWeight: 800, color, letterSpacing: '-0.02em' }}>
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 18, fontWeight: 500, color, letterSpacing: '0.02em' }}>
                 {value}
               </div>
             </div>
@@ -226,7 +226,7 @@ export default function LogsPage() {
             borderRadius: 12, padding: '48px 24px', textAlign: 'center',
           }}>
             <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
-            <div style={{ fontSize: 14, color: 'var(--text2)', fontWeight: 600, marginBottom: 6 }}>No scans yet</div>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text2)', fontWeight: 500, marginBottom: 6 }}>No scans yet</div>
             <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text3)' }}>
               Start the bot and run a scan to see execution history here.
             </div>
