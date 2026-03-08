@@ -1,5 +1,5 @@
 import type { Signal } from '@/types'
-import { formatPrice, formatUSDC, formatPct, hoursUntilClose, formatHours } from '@/lib/format'
+import { formatPrice, formatUSDC, formatPct, hoursUntilClose, formatHours, timeAgo } from '@/lib/format'
 
 interface SignalCardProps {
   signal: Signal
@@ -22,13 +22,16 @@ export function SignalCard({ signal, maxHours = 48 }: SignalCardProps) {
       onMouseEnter={e => (e.currentTarget.style.borderColor = 'rgba(240,180,41,0.3)')}
       onMouseLeave={e => (e.currentTarget.style.borderColor = 'var(--border)')}
     >
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 12, gap: 8 }}>
-        <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text)', lineHeight: 1.4, flex: 1 }}>
-          {signal.question}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 8, gap: 8 }}>
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text3)' }}>
+          #{signal.id} · {timeAgo(signal.detected_at)}
         </div>
         <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--green)', whiteSpace: 'nowrap' }}>
           {formatPct(signal.net_profit_pct * 100, 1)}
         </div>
+      </div>
+      <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text)', lineHeight: 1.4, marginBottom: 12 }}>
+        {signal.question}
       </div>
 
       <div className="signal-meta" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
