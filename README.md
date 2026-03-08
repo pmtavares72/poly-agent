@@ -140,11 +140,12 @@ bash start.sh
 ```
 
 `start.sh` hace automáticamente:
-1. Instala dependencias Python (`pip install -r requirements.txt`)
-2. Inicializa la BD SQLite (`polyagent.db`) con la configuración por defecto
-3. Arranca la API FastAPI en puerto 8765
-4. Hace el build de Next.js y lo arranca en puerto 3000
-5. Configura el cron `*/15 * * * *` para el bot
+1. Detecta `python3` o `python` automáticamente
+2. Instala dependencias Python (`python3 -m pip install -r requirements.txt`)
+3. Inicializa la BD SQLite (`polyagent.db`) con la configuración por defecto
+4. Arranca la API FastAPI en puerto 8765
+5. Hace el build de Next.js y lo arranca en puerto 3000
+6. Configura el cron `*/15 * * * *` para el bot
 
 ### Acceder a la app
 
@@ -164,9 +165,21 @@ bash stop.sh
 
 ## Uso de la app
 
-### 1. Configurar el bot (Strategies page)
+### Navegación de la app
 
-Antes de arrancar el bot, ve a **Strategies** y ajusta:
+| Sidebar | Página |
+|---|---|
+| Dashboard | KPIs, gráfico PnL, control del bot, señales activas, historial |
+| Strategies | Parámetros editables del Bond Hunter |
+| Signals | Sección de señales en el dashboard |
+| Trade History | Historial en el dashboard |
+| Settings | Alias de Strategies — misma página de configuración |
+
+---
+
+### 1. Configurar el bot (Strategies / Settings)
+
+Antes de arrancar el bot, ve a **Strategies** (o **Settings**) y ajusta:
 
 - **INITIAL_CAPITAL** — cuánto USDC quieres usar como referencia (no es dinero real, es paper trading)
 - **MIN_PROBABILITY / MAX_PROBABILITY** — rango de precio YES para entrar (por defecto 0.95–0.995)
