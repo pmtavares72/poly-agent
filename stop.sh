@@ -11,7 +11,7 @@ if [ -f "$LOG_DIR/api.pid" ]; then
   kill $(cat "$LOG_DIR/api.pid") 2>/dev/null && echo "  ✓ API stopped"
   rm "$LOG_DIR/api.pid"
 fi
-pkill -f "uvicorn api:app" 2>/dev/null || true
+pkill -f "uvicorn api:app" 2>/dev/null || pkill -f "uvicorn" 2>/dev/null || true
 
 # Parar Frontend
 if [ -f "$LOG_DIR/frontend.pid" ]; then

@@ -19,6 +19,12 @@ echo "======================================"
 echo ""
 echo "[1/5] Checking Python dependencies..."
 PYTHON_BIN=$(which python3 2>/dev/null || which python)
+if [ -z "$PYTHON_BIN" ]; then
+  echo "ERROR: python3 not found. Install it with: apt install python3 python3-pip"
+  exit 1
+fi
+echo "      Using: $PYTHON_BIN ($(${PYTHON_BIN} --version))"
+$PYTHON_BIN -m pip install -r requirements.txt -q --break-system-packages 2>/dev/null || \
 $PYTHON_BIN -m pip install -r requirements.txt -q
 echo "      ✓ Python deps OK"
 
@@ -35,7 +41,7 @@ echo ""
 echo "[3/5] Starting FastAPI server on port 8765..."
 pkill -f "uvicorn api:app" 2>/dev/null || true
 sleep 1
-nohup uvicorn api:app --host 0.0.0.0 --port 8765 \
+nohup $PYTHON_BIN -m uvicorn api:app --host 0.0.0.0 --port 8765 \
   > "$LOG_DIR/api.log" 2>&1 &
 API_PID=$!
 echo "      ✓ API started (pid=$API_PID)"
