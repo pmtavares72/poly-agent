@@ -1082,9 +1082,23 @@ def run_paper(params: dict):
     # Primero resolver señales anteriores pendientes
     resolved_count = resolve_pending_signals(conn)
 
-    console.print(f"\n[cyan]Escaneando mercados abiertos en busca de señales...[/cyan]\n")
-    markets = fetch_open_markets(min_liquidity)
-    console.print(f"[cyan]  {len(markets)} mercados activos encontrados[/cyan]\n")
+    # Capital disponible = initial_capital - capital ya comprometido en señales abiertas
+    cur_cap = conn.cursor()
+    cur_cap.execute("SELECT COALESCE(SUM(position_usdc),0), COUNT(*) FROM signals WHERE status='open'")
+    committed_usdc, open_count = cur_cap.fetchone()
+    available_capital = max(0.0, capital - committed_usdc)
+
+    MAX_OPEN_SIGNALS = 10  # máximo de posiciones abiertas simultáneas
+
+    if open_count >= MAX_OPEN_SIGNALS:
+        console.print(f"\n[yellow]⚠ {open_count} señales abiertas (límite={MAX_OPEN_SIGNALS}). No se abren nuevas posiciones.[/yellow]\n")
+        new_signals = 0
+        markets = []
+    else:
+        console.print(f"\n[cyan]Escaneando mercados abiertos en busca de señales...[/cyan]\n")
+        console.print(f"[cyan]  Capital disponible: ${available_capital:.2f} (${committed_usdc:.2f} comprometido en {open_count} señales)[/cyan]\n")
+        markets = fetch_open_markets(min_liquidity)
+        console.print(f"[cyan]  {len(markets)} mercados activos encontrados[/cyan]\n")
 
     new_signals = 0
     markets_checked = 0
@@ -1148,6 +1162,10 @@ def run_paper(params: dict):
         if cur.fetchone():
             continue  # ya registrada
 
+        # Respetar límite de posiciones abiertas simultáneas
+        if open_count + new_signals >= MAX_OPEN_SIGNALS:
+            break
+
         # Spread y profit
         liquidity_raw = m.get("liquidity")
         liquidity = float(liquidity_raw or 0) if liquidity_raw is not None else None
@@ -1163,8 +1181,11 @@ def run_paper(params: dict):
             skipped_spread += 1
             continue
 
-        # Kelly sizing
-        position_usdc = kelly_size(capital, current_price, ask_price, kelly_fraction, max_position_pct)
+        # Kelly sizing sobre capital disponible (no comprometido)
+        if available_capital < 5.0:
+            break  # sin capital suficiente para abrir más posiciones
+        position_usdc = kelly_size(available_capital, current_price, ask_price, kelly_fraction, max_position_pct)
+        available_capital -= position_usdc  # descontar para siguientes iteraciones
         shares = position_usdc / ask_price
         protocol_fee = position_usdc * fee_rate
         breakeven = ask_price + fee_rate
