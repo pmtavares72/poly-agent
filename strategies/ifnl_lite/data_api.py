@@ -49,7 +49,7 @@ class DataApiClient:
         self._running = False
         self._session: Optional[aiohttp.ClientSession] = None
         self._on_trades_callbacks: list[Callable] = []
-        self._last_seen_ts: dict[str, str] = {}  # market_id -> last trade timestamp
+        self._last_seen_ts: dict[str, int] = {}  # market_id -> last trade timestamp (unix)
 
     def on_trades(self, callback: Callable):
         """Register callback: callback(market_id, list[WalletTrade])"""
@@ -116,11 +116,17 @@ class DataApiClient:
         if not isinstance(data, list):
             return []
 
-        last_ts = self._last_seen_ts.get(market_id, "")
+        last_ts = self._last_seen_ts.get(market_id, 0)
         new_trades = []
 
         for trade in data:
-            ts = trade.get("timestamp", "")
+            ts_raw = trade.get("timestamp", 0)
+            # Normalize timestamp to comparable type (int or float)
+            try:
+                ts = int(ts_raw) if isinstance(ts_raw, (int, float, str)) else 0
+            except (ValueError, TypeError):
+                ts = 0
+            
             if ts <= last_ts:
                 continue
 
@@ -138,7 +144,7 @@ class DataApiClient:
             new_trades.append(WalletTrade(
                 proxy_wallet=proxy_wallet,
                 market_id=market_id,
-                timestamp=ts,
+                timestamp=str(ts),  # Store as string for consistency
                 side=trade.get("side", ""),
                 outcome=trade.get("outcome", ""),
                 price=price,
@@ -148,7 +154,7 @@ class DataApiClient:
 
         if new_trades:
             # Update last seen timestamp to newest trade
-            newest_ts = max(t.timestamp for t in new_trades)
+            newest_ts = max(int(t.timestamp) for t in new_trades)
             self._last_seen_ts[market_id] = newest_ts
 
         return new_trades

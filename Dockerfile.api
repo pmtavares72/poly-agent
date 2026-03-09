@@ -1,0 +1,25 @@
+# PolyAgent API - Python FastAPI
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
+COPY api.py agent.py backtest.py ./
+COPY strategies/ ./strategies/
+COPY migrations.sql entrypoint.sh ./
+
+# Make entrypoint executable
+RUN chmod +x entrypoint.sh
+
+# Create data directory
+RUN mkdir -p /app/data /app/logs
+
+# Expose API port
+EXPOSE 8765
+
+# Run entrypoint (applies migrations + starts IFNL if enabled + starts API)
+CMD ["./entrypoint.sh"]
