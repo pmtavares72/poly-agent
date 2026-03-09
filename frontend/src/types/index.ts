@@ -70,65 +70,7 @@ export interface BotConfig {
   max_capital_deployed_pct: number
   fee_rate: number
   scan_interval_min: number
-  // NegRisk Arb strategy
-  nr_enabled: number
-  nr_min_gap: number
-  nr_min_leg_liquidity: number
-  nr_max_legs: number
-  nr_fee_rate: number
-  nr_max_position_usdc: number
   updated_at: string | null
-}
-
-export interface NegRiskLeg {
-  token_id: string
-  question: string
-  price: number
-  ask: number
-  weight: number
-  usdc: number
-}
-
-export interface NegRiskSignal {
-  id: number
-  detected_at: string
-  event_id: string
-  event_title: string
-  event_url: string | null
-  n_legs: number
-  sum_asks: number
-  gap_pct: number
-  net_profit_pct: number
-  min_liquidity: number
-  total_usdc: number
-  fee_usdc: number
-  legs_json: string        // JSON string — parse with JSON.parse()
-  winning_leg: string | null
-  outcome: 'WIN' | 'LOSS' | null
-  resolved_at: string | null
-  pnl_usdc: number | null
-  pnl_pct: number | null
-  status: 'open' | 'resolved' | 'expired'
-}
-
-export interface NegRiskSignalsResponse {
-  total: number
-  limit: number
-  offset: number
-  data: NegRiskSignal[]
-}
-
-export interface NegRiskStats {
-  total: number
-  open: number
-  resolved: number
-  wins: number
-  losses: number
-  win_rate: number
-  total_pnl: number
-  avg_gap_pct: number
-  best_trade: number
-  worst_trade: number
 }
 
 export interface BotStatus {

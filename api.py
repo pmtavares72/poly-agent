@@ -68,13 +68,6 @@ class ConfigUpdate(BaseModel):
     max_capital_deployed_pct:    Optional[float] = None
     fee_rate:                    Optional[float] = None
     scan_interval_min:  Optional[int]   = None
-    # NegRisk Arb strategy
-    nr_enabled:              Optional[int]   = None
-    nr_min_gap:              Optional[float] = None
-    nr_min_leg_liquidity:    Optional[float] = None
-    nr_max_legs:             Optional[int]   = None
-    nr_fee_rate:             Optional[float] = None
-    nr_max_position_usdc:    Optional[float] = None
 
 
 # ─────────────────────────────────────────────
@@ -90,16 +83,6 @@ def health():
 # CONFIG
 # ─────────────────────────────────────────────
 
-NR_DEFAULTS = {
-    "nr_enabled": 1,
-    "nr_min_gap": 0.02,
-    "nr_min_leg_liquidity": 200.0,
-    "nr_max_legs": 20,
-    "nr_fee_rate": 0.02,
-    "nr_max_position_usdc": 50.0,
-}
-
-
 @app.get("/config")
 def get_config():
     """Devuelve la configuración actual del bot."""
@@ -107,19 +90,10 @@ def get_config():
     cur = conn.cursor()
     cur.execute("SELECT * FROM config WHERE id=1")
     row = cur.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Config not found — run agent.py once to initialize DB")
-    cfg = dict(row)
-    # Write NegRisk defaults into DB for any NULL columns (existing rows pre-migration)
-    missing = {k: v for k, v in NR_DEFAULTS.items() if cfg.get(k) is None}
-    if missing:
-        fields = ", ".join(f"{k}=?" for k in missing)
-        conn.execute(f"UPDATE config SET {fields} WHERE id=1", list(missing.values()))
-        conn.commit()
-        cfg.update(missing)
     conn.close()
-    return cfg
+    if not row:
+        raise HTTPException(status_code=404, detail="Config not found — run agent.py once to initialize DB")
+    return dict(row)
 
 
 @app.post("/config")
@@ -349,122 +323,6 @@ def get_stats():
         "bot_scan_count": bot.get("scan_count", 0),
         "bot_last_error": bot.get("last_error"),
         "generated_at":   datetime.now(timezone.utc).isoformat(),
-    }
-
-
-# ─────────────────────────────────────────────
-# NEGRISK SIGNALS
-# ─────────────────────────────────────────────
-
-def _ensure_negrisk_table(conn):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS negrisk_signals (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            detected_at     TEXT NOT NULL,
-            event_id        TEXT NOT NULL,
-            event_title     TEXT,
-            event_url       TEXT,
-            n_legs          INTEGER,
-            sum_asks        REAL,
-            gap_pct         REAL,
-            net_profit_pct  REAL,
-            min_liquidity   REAL,
-            total_usdc      REAL,
-            fee_usdc        REAL,
-            legs_json       TEXT,
-            winning_leg     TEXT,
-            outcome         TEXT,
-            resolved_at     TEXT,
-            pnl_usdc        REAL,
-            pnl_pct         REAL,
-            status          TEXT DEFAULT 'open'
-        )
-    """)
-    conn.commit()
-
-
-@app.get("/negrisk/signals")
-def get_negrisk_signals(
-    status: Optional[str] = Query(None, description="open | resolved | expired"),
-    limit: int = Query(100, le=500),
-    offset: int = Query(0),
-):
-    conn = get_conn()
-    _ensure_negrisk_table(conn)
-    cur = conn.cursor()
-    if status in ("open", "resolved", "expired"):
-        cur.execute(
-            "SELECT * FROM negrisk_signals WHERE status=? ORDER BY detected_at DESC LIMIT ? OFFSET ?",
-            (status, limit, offset),
-        )
-    else:
-        cur.execute(
-            "SELECT * FROM negrisk_signals ORDER BY detected_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        )
-    data = rows(cur)
-    cur.execute(
-        "SELECT COUNT(*) FROM negrisk_signals" + (" WHERE status=?" if status else ""),
-        (status,) if status else (),
-    )
-    total = cur.fetchone()[0]
-    conn.close()
-    return {"total": total, "limit": limit, "offset": offset, "data": data}
-
-
-@app.get("/negrisk/signals/open")
-def get_negrisk_open(limit: int = Query(50, le=200), offset: int = Query(0)):
-    return get_negrisk_signals(status="open", limit=limit, offset=offset)
-
-
-@app.get("/negrisk/signals/{signal_id}")
-def get_negrisk_signal(signal_id: int):
-    conn = get_conn()
-    _ensure_negrisk_table(conn)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM negrisk_signals WHERE id=?", (signal_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="NegRisk signal not found")
-    return dict(row)
-
-
-@app.get("/negrisk/stats")
-def get_negrisk_stats():
-    conn = get_conn()
-    _ensure_negrisk_table(conn)
-    cur = conn.cursor()
-
-    def scalar(sql, params=()):
-        cur.execute(sql, params)
-        v = cur.fetchone()[0]
-        return v or 0
-
-    total     = scalar("SELECT COUNT(*) FROM negrisk_signals")
-    open_c    = scalar("SELECT COUNT(*) FROM negrisk_signals WHERE status='open'")
-    resolved  = scalar("SELECT COUNT(*) FROM negrisk_signals WHERE status='resolved'")
-    wins      = scalar("SELECT COUNT(*) FROM negrisk_signals WHERE outcome='WIN'")
-    losses    = scalar("SELECT COUNT(*) FROM negrisk_signals WHERE outcome='LOSS'")
-    total_pnl = scalar("SELECT SUM(pnl_usdc) FROM negrisk_signals WHERE status='resolved'")
-    avg_gap   = scalar("SELECT AVG(gap_pct) FROM negrisk_signals")
-    best      = scalar("SELECT MAX(pnl_usdc) FROM negrisk_signals WHERE status='resolved'")
-    worst     = scalar("SELECT MIN(pnl_usdc) FROM negrisk_signals WHERE status='resolved'")
-
-    win_rate = round(wins / resolved * 100, 1) if resolved > 0 else 0.0
-    conn.close()
-
-    return {
-        "total": total,
-        "open": open_c,
-        "resolved": resolved,
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "total_pnl": round(float(total_pnl), 4),
-        "avg_gap_pct": round(float(avg_gap), 3),
-        "best_trade": round(float(best), 4),
-        "worst_trade": round(float(worst), 4),
     }
 
 

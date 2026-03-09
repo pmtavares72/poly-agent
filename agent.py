@@ -199,41 +199,12 @@ def init_db(db_path: str = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.d
             status              TEXT DEFAULT 'open'  -- open | resolved | expired
         );
 
-        -- NegRisk Arb: oportunidades detectadas en eventos multi-outcome
-        CREATE TABLE IF NOT EXISTS negrisk_signals (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            detected_at     TEXT NOT NULL,
-            event_id        TEXT NOT NULL,       -- Polymarket event slug/id
-            event_title     TEXT,               -- Título del evento
-            event_url       TEXT,
-            n_legs          INTEGER,            -- Número de outcomes en la cesta
-            sum_asks        REAL,               -- Suma de best_ask de todos los legs
-            gap_pct         REAL,               -- (1 - sum_asks) * 100
-            net_profit_pct  REAL,               -- gap_pct - fee_rate*100
-            min_liquidity   REAL,               -- liquidez mínima entre todas las piernas
-            total_usdc      REAL,               -- importe total invertido en la cesta
-            fee_usdc        REAL,               -- fees estimados
-            legs_json       TEXT,               -- JSON: [{token_id, question, ask, weight, usdc}]
-            winning_leg     TEXT,               -- token_id del leg que resolvió YES
-            outcome         TEXT,               -- NULL | 'WIN' | 'LOSS'
-            resolved_at     TEXT,
-            pnl_usdc        REAL,
-            pnl_pct         REAL,
-            status          TEXT DEFAULT 'open' -- open | resolved | expired
-        );
     """)
     conn.commit()
 
     # Migraciones: añadir columnas nuevas a tablas existentes sin perder datos
     migrations = [
         ("config", "max_capital_deployed_pct", "REAL DEFAULT 0.50"),
-        # NegRisk Arb strategy config
-        ("config", "nr_enabled",              "INTEGER DEFAULT 1"),
-        ("config", "nr_min_gap",              "REAL DEFAULT 0.02"),    # 2% gap mínimo antes de fees
-        ("config", "nr_min_leg_liquidity",    "REAL DEFAULT 200.0"),   # liquidez mínima por leg
-        ("config", "nr_max_legs",             "INTEGER DEFAULT 20"),   # máx. legs a considerar
-        ("config", "nr_fee_rate",             "REAL DEFAULT 0.02"),    # fee 2% estimado
-        ("config", "nr_max_position_usdc",    "REAL DEFAULT 50.0"),    # máx. inversión por cesta
     ]
     for table, column, definition in migrations:
         try:
@@ -1085,327 +1056,6 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
     return resolved_count
 
 
-# ─────────────────────────────────────────────
-# NEGRISK ARB STRATEGY
-# ─────────────────────────────────────────────
-
-GAMMA_EVENTS_API = "https://gamma-api.polymarket.com/events"
-
-def fetch_negrisk_events() -> list:
-    """Descarga eventos NegRisk activos de la Gamma API."""
-    events = []
-    offset = 0
-    limit = 100
-    while True:
-        params = {
-            "negRisk": "true",
-            "active": "true",
-            "closed": "false",
-            "limit": limit,
-            "offset": offset,
-        }
-        data = safe_get(GAMMA_EVENTS_API, params)
-        if not data:
-            break
-        batch = data if isinstance(data, list) else data.get("events", [])
-        if not batch:
-            break
-        events.extend(batch)
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-        offset += limit
-        if len(batch) < limit:
-            break
-    return events
-
-
-def resolve_pending_negrisk(conn: sqlite3.Connection) -> int:
-    """
-    Revisa señales NegRisk abiertas cuya fecha de cierre pasó y trata de resolverlas.
-    Busca en los mercados del evento cuál resolvió YES.
-    Devuelve el número de señales resueltas.
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, event_id, legs_json, total_usdc, fee_usdc, status
-        FROM negrisk_signals WHERE status='open'
-    """)
-    pending = cur.fetchall()
-    if not pending:
-        return 0
-
-    resolved_count = 0
-    now = datetime.now(timezone.utc)
-
-    for row in pending:
-        sig_id, event_id, legs_json_str, total_usdc, fee_usdc, _ = row
-        try:
-            legs = json.loads(legs_json_str or "[]")
-        except (json.JSONDecodeError, TypeError):
-            continue
-
-        # Consultar el evento en Gamma API
-        data = safe_get(GAMMA_EVENTS_API, {"id": event_id})
-        if not data:
-            # Intentar por slug
-            data = safe_get(GAMMA_EVENTS_API, {"slug": event_id})
-        if not data:
-            continue
-
-        events_batch = data if isinstance(data, list) else []
-        if not events_batch:
-            continue
-
-        event = events_batch[0]
-        markets = event.get("markets", [])
-
-        winning_token = None
-        for m in markets:
-            op_raw = m.get("outcomePrices") or []
-            if isinstance(op_raw, str):
-                try: op_raw = json.loads(op_raw)
-                except: op_raw = []
-            if len(op_raw) < 2:
-                continue
-            try:
-                op = [float(x) for x in op_raw]
-            except (TypeError, ValueError):
-                continue
-
-            if op[0] == 1.0:
-                # YES leg resolvió
-                clob_raw = m.get("clobTokenIds") or []
-                if isinstance(clob_raw, str):
-                    try: clob_raw = json.loads(clob_raw)
-                    except: clob_raw = []
-                if clob_raw:
-                    winning_token = clob_raw[0]
-                break
-            elif op[1] == 1.0:
-                # NO leg resolvió (el YES de este outcome fue 0)
-                # En NegRisk, si el YES de un outcome es 0, ese outcome perdió
-                # Seguir buscando cuál ganó
-                continue
-
-        if winning_token is None:
-            # No se puede determinar ganador aún — ¿expirado?
-            # Buscar cualquier mercado con closes_at pasado > 24h
-            all_closed = all(
-                datetime.fromisoformat(
-                    (m.get("endDate") or m.get("endDateIso") or now.isoformat()).replace("Z", "+00:00")
-                ) < now
-                for m in markets if m.get("endDate") or m.get("endDateIso")
-            )
-            if all_closed and markets:
-                first_close_str = markets[0].get("endDate") or markets[0].get("endDateIso") or ""
-                try:
-                    first_close = datetime.fromisoformat(first_close_str.replace("Z", "+00:00"))
-                    if (now - first_close).total_seconds() > 86400:
-                        cur.execute("UPDATE negrisk_signals SET status='expired' WHERE id=?", (sig_id,))
-                        conn.commit()
-                except (ValueError, TypeError):
-                    pass
-            continue
-
-        # Determinar PnL
-        winning_leg = next((l for l in legs if l.get("token_id") == winning_token), None)
-        if winning_leg:
-            # Ganamos: el leg ganador paga 1.0 por share
-            # position en ese leg = leg["usdc"], shares = leg["usdc"] / leg["ask"]
-            leg_usdc = winning_leg.get("usdc", 0)
-            leg_ask = winning_leg.get("ask", 1.0)
-            shares_won = leg_usdc / leg_ask if leg_ask > 0 else 0
-            revenue = shares_won * 1.0
-            pnl = revenue - (total_usdc or 0) - (fee_usdc or 0)
-            outcome = "WIN"
-        else:
-            # El leg ganador no estaba en nuestra cesta (no debería pasar si compramos todos)
-            # o no encontramos el leg — tratar como pérdida total
-            pnl = -((total_usdc or 0) + (fee_usdc or 0))
-            outcome = "LOSS"
-
-        pnl_pct = (pnl / total_usdc * 100) if total_usdc else 0
-        icon = "✅" if outcome == "WIN" else "❌"
-        color = "green" if pnl >= 0 else "red"
-        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-        console.print(f"  {icon}  [bold]NegRisk #{sig_id}[/bold]  [{color}]{pnl_str}[/{color}]  (resuelto)")
-
-        cur.execute("""
-            UPDATE negrisk_signals
-            SET winning_leg=?, outcome=?, resolved_at=?, pnl_usdc=?, pnl_pct=?, status='resolved'
-            WHERE id=?
-        """, (winning_token, outcome, now.isoformat(), pnl, pnl_pct, sig_id))
-        conn.commit()
-        resolved_count += 1
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-    return resolved_count
-
-
-def run_negrisk_scan(params: dict, conn: sqlite3.Connection) -> dict:
-    """
-    Escanea eventos NegRisk activos buscando cestas donde la suma de best_ask < 1 - nr_min_gap.
-    Registra oportunidades en negrisk_signals.
-    Devuelve un dict con contadores.
-    """
-    nr_min_gap         = params.get("nr_min_gap", 0.02)
-    nr_min_leg_liq     = params.get("nr_min_leg_liquidity", 200.0)
-    nr_max_legs        = params.get("nr_max_legs", 20)
-    nr_fee_rate        = params.get("nr_fee_rate", 0.02)
-    nr_max_position    = params.get("nr_max_position_usdc", 50.0)
-
-    resolved_count = resolve_pending_negrisk(conn)
-
-    console.print("\n[magenta]Escaneando eventos NegRisk...[/magenta]")
-    events = fetch_negrisk_events()
-    console.print(f"[magenta]  {len(events)} eventos NegRisk activos encontrados[/magenta]")
-
-    new_signals = 0
-    checked = 0
-    skipped_gap = 0
-    skipped_liq = 0
-    skipped_legs = 0
-    skipped_exists = 0
-
-    for event in events:
-        event_id = str(event.get("id") or event.get("slug") or "")
-        event_title = event.get("title") or event.get("question") or "Unknown Event"
-        event_slug = event.get("slug") or ""
-        event_url = f"https://polymarket.com/event/{event_slug}" if event_slug else ""
-        markets = event.get("markets", [])
-
-        if len(markets) < 3:
-            skipped_legs += 1
-            continue
-        if len(markets) > nr_max_legs:
-            skipped_legs += 1
-            continue
-
-        checked += 1
-
-        # Comprobar si ya tenemos esta señal (cualquier estado) para evitar duplicados
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM negrisk_signals WHERE event_id=?", (event_id,))
-        if cur.fetchone():
-            skipped_exists += 1
-            continue
-
-        # Calcular suma de best_ask de todos los legs
-        legs = []
-        min_liq = float("inf")
-        sum_asks = 0.0
-        valid = True
-
-        for m in markets:
-            # Best ask: usar outcomePrices[0] (precio YES actual) como proxy
-            op_raw = m.get("outcomePrices") or []
-            if isinstance(op_raw, str):
-                try: op_raw = json.loads(op_raw)
-                except: op_raw = []
-
-            try:
-                yes_price = float(op_raw[0]) if op_raw else None
-            except (TypeError, ValueError, IndexError):
-                yes_price = None
-
-            # Filtrar precios near-zero (mercados ilíquidos/inactivos) y precios >= 0.99
-            # Un precio <0.02 significa el outcome es considerado casi imposible — no es arb real
-            if yes_price is None or yes_price < 0.02 or yes_price >= 0.99:
-                valid = False
-                break
-
-            # Liquidez
-            liq = float(m.get("liquidity") or 0)
-            if liq < nr_min_leg_liq:
-                valid = False
-                break
-
-            min_liq = min(min_liq, liq)
-
-            clob_raw = m.get("clobTokenIds") or []
-            if isinstance(clob_raw, str):
-                try: clob_raw = json.loads(clob_raw)
-                except: clob_raw = []
-            token_id = clob_raw[0] if clob_raw else None
-            if not token_id:
-                valid = False
-                break
-
-            question = m.get("question") or m.get("title") or ""
-            # Estimar ask = price + spread pequeño (en NegRisk la liquidez suele ser razonable)
-            spread = 0.005 if liq > 2000 else 0.01
-            ask = min(yes_price + spread / 2, 0.999)
-
-            legs.append({
-                "token_id": token_id,
-                "question": question,
-                "price": round(yes_price, 5),
-                "ask": round(ask, 5),
-            })
-            sum_asks += ask
-
-        if not valid:
-            skipped_liq += 1
-            continue
-
-        gap = 1.0 - sum_asks
-        net_profit_pct = gap - nr_fee_rate
-
-        if net_profit_pct < nr_min_gap:
-            skipped_gap += 1
-            continue
-
-        # Sizing proporcional: cada leg recibe (ask_leg / sum_asks) * total
-        total_usdc = min(nr_max_position, nr_max_position)  # usar límite máximo
-        for leg in legs:
-            leg["weight"] = round(leg["ask"] / sum_asks, 5)
-            leg["usdc"] = round(leg["weight"] * total_usdc, 4)
-
-        fee_usdc = total_usdc * nr_fee_rate
-        legs_json = json.dumps(legs)
-
-        cur.execute("""
-            INSERT INTO negrisk_signals (
-                detected_at, event_id, event_title, event_url,
-                n_legs, sum_asks, gap_pct, net_profit_pct,
-                min_liquidity, total_usdc, fee_usdc, legs_json, status
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            datetime.now(timezone.utc).isoformat(),
-            event_id, event_title, event_url,
-            len(legs), round(sum_asks, 5), round(gap * 100, 3),
-            round(net_profit_pct * 100, 3),
-            min_liq, total_usdc, fee_usdc,
-            legs_json, "open"
-        ))
-        conn.commit()
-        new_signals += 1
-
-        e_short = (event_title[:50] + "…") if len(event_title) > 50 else event_title
-        console.print(
-            f"  🎰  [bold magenta]{e_short}[/bold magenta]  "
-            f"[cyan]{len(legs)} legs[/cyan]  "
-            f"gap=[green]+{gap*100:.2f}%[/green]  "
-            f"net=[green]+{net_profit_pct*100:.2f}%[/green]  "
-            f"total=[yellow]${total_usdc:.2f}[/yellow]"
-        )
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-    console.print(f"\n[magenta]NegRisk scan completo:[/magenta]")
-    console.print(f"  Eventos comprobados:  [cyan]{checked}[/cyan]")
-    console.print(f"  Señales nuevas:       [green]{new_signals}[/green]")
-    console.print(f"  Señales resueltas:    [green]{resolved_count}[/green]")
-    console.print(f"  Gap insuficiente:     [dim]{skipped_gap}[/dim]")
-    console.print(f"  Liq insuficiente:     [dim]{skipped_liq}[/dim]")
-    console.print(f"  Legs fuera de rango:  [dim]{skipped_legs}[/dim]")
-    console.print(f"  Ya registradas:       [dim]{skipped_exists}[/dim]")
-
-    return {
-        "new_signals": new_signals,
-        "resolved_count": resolved_count,
-        "checked": checked,
-    }
-
-
 def run_paper(params: dict):
     """
     Modo paper trading: escanea mercados abiertos AHORA, detecta señales
@@ -1607,10 +1257,6 @@ def run_paper(params: dict):
     ))
     conn.commit()
 
-    # Correr NegRisk Arb scan si está habilitado (mismo conn, antes de cerrar)
-    if params.get("nr_enabled", 1):
-        run_negrisk_scan(params, conn)
-
     conn.close()
 
     console.print(f"\n[bold]Paper trading scan completo.[/bold]")
@@ -1623,7 +1269,7 @@ def run_paper(params: dict):
     console.print(f"  Sin datos CLOB:            [dim]{skipped_no_data}[/dim]")
     console.print(f"  Precio fuera de rango:     [dim]{skipped_price}[/dim]")
     console.print(f"  Duración:                  [dim]{duration_sec}s[/dim]")
-    console.print(f"  Datos guardados en:        [bold]polyagent.db[/bold] → tablas [bold]signals[/bold] + [bold]negrisk_signals[/bold]\n")
+    console.print(f"  Datos guardados en:        [bold]polyagent.db[/bold] → tabla [bold]signals[/bold]\n")
 
 
 # ─────────────────────────────────────────────
@@ -1682,13 +1328,6 @@ def load_config_from_db(conn: sqlite3.Connection) -> dict:
         "max_position_pct":          cfg["max_position_pct"],
         "max_capital_deployed_pct":  cfg.get("max_capital_deployed_pct", 0.50),
         "fee_rate":                  cfg["fee_rate"],
-        # NegRisk Arb strategy params
-        "nr_enabled":              cfg.get("nr_enabled", 1),
-        "nr_min_gap":              cfg.get("nr_min_gap", 0.02),
-        "nr_min_leg_liquidity":    cfg.get("nr_min_leg_liquidity", 200.0),
-        "nr_max_legs":             cfg.get("nr_max_legs", 20),
-        "nr_fee_rate":             cfg.get("nr_fee_rate", 0.02),
-        "nr_max_position_usdc":    cfg.get("nr_max_position_usdc", 50.0),
     }
 
 
