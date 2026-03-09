@@ -37,14 +37,14 @@ class BondHunterStrategy(BaseStrategy):
     def default_config(self) -> dict:
         return {
             "initial_capital": 500.0,
-            "min_probability": 0.95,
+            "min_probability": 0.92,       # was 0.95 — wider range captures more markets
             "max_probability": 0.995,
-            "min_profit_net": 0.015,
-            "max_hours_to_close": 48.0,
-            "min_liquidity_usdc": 500.0,
-            "kelly_fraction": 0.25,
-            "max_position_pct": 0.15,
-            "max_capital_deployed_pct": 0.50,
+            "min_profit_net": 0.010,       # was 0.015 — accept thinner edge (1% net)
+            "max_hours_to_close": 168.0,   # was 48h — allow up to 7 days (more markets)
+            "min_liquidity_usdc": 300.0,   # was 500 — more markets eligible
+            "kelly_fraction": 0.35,        # was 0.25 — more aggressive sizing
+            "max_position_pct": 0.20,      # was 0.15 — larger positions on good signals
+            "max_capital_deployed_pct": 0.70,  # was 0.50 — deploy more capital
             "fee_rate": 0.005,
             "scan_interval_min": 15,
         }
@@ -319,8 +319,20 @@ def estimate_spread(liquidity: float) -> float:
 
 def kelly_size(capital: float, entry_price: float, ask_price: float,
                kelly_fraction: float, max_pct: float) -> float:
-    b = (1.0 - ask_price) / ask_price
-    p = entry_price
+    """
+    Position sizing for Bond Hunter.
+
+    Classic Kelly uses market price as win probability, which gives kelly_f ≈ 0
+    for near-certain markets (the spread eats all the edge). Bond Hunter's thesis
+    is that these markets resolve YES with ~99% certainty, so we use an assumed
+    win probability higher than the market price.
+
+    For markets at 0.92-0.995, we assume true win probability = 0.995.
+    """
+    # Bond Hunter edge: we believe win prob is higher than market price
+    assumed_win_prob = 0.995
+    b = (1.0 - ask_price) / ask_price  # payout odds
+    p = assumed_win_prob
     q = 1.0 - p
     kelly_f = max(0.0, (b * p - q) / b)
     position = capital * kelly_fraction * kelly_f
