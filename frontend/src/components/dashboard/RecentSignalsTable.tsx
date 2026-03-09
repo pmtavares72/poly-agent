@@ -90,8 +90,9 @@ export function RecentSignalsTable({ signals, total }: RecentSignalsTableProps) 
         </span>
       </div>
 
+      <div style={{ maxHeight: 484, overflowY: 'auto' }}>
       <table className="signals-table">
-        <thead>
+        <thead style={{ position: 'sticky', top: 0, zIndex: 1, background: 'var(--surface)' }}>
           <tr>
             <SortTh label="#"         sortKey="id"             current={sortKey} dir={sortDir} onSort={handleSort} />
             <SortTh label="Detected"  sortKey="detected_at"    current={sortKey} dir={sortDir} onSort={handleSort} />
@@ -134,6 +135,7 @@ export function RecentSignalsTable({ signals, total }: RecentSignalsTableProps) 
           })}
         </tbody>
       </table>
+      </div>
     </div>
   )
 }

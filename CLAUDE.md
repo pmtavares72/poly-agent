@@ -2,7 +2,12 @@
 
 ## Overview
 
-PolyAgent is a Polymarket prediction market trading bot built on the **Bond Hunter** strategy: buy YES tokens in binary markets trading at 0.95–0.995 (near-certain outcomes), hold until resolution (~48h), exit at 1.0 for small but consistent returns. Runs in paper trading mode with real market data but no real capital.
+PolyAgent is a Polymarket prediction market trading bot with two independent paper-trading strategies:
+
+1. **Bond Hunter** — Buys YES tokens in binary markets at 0.95–0.995, holds until resolution (~48h), exits at 1.0 for small consistent returns.
+2. **NegRisk Arb Hunter** — Scans NegRisk multi-outcome events (e.g. "Who wins the Premier League?") where the sum of all YES prices < 1.0. Buys proportionally across every outcome — one always resolves YES at $1, locking in a risk-free spread. Sports markets are underexplored by other bots.
+
+Both strategies run in paper trading mode (real market data, no real capital). Each has its own config parameters, DB tables, and P&L tracking.
 
 **Stack:**
 - Backend: Python 3 — FastAPI + SQLite
@@ -148,6 +153,39 @@ mode             TEXT DEFAULT 'paper'
 #### `runs` + `trades` (backtest only)
 Separate tables for historical backtest results. `trades` rows have `run_id` FK to `runs`. Not used by paper trading.
 
+#### `negrisk_signals` (NegRisk Arb, one row per detected basket)
+```sql
+id              INTEGER PRIMARY KEY AUTOINCREMENT
+detected_at     TEXT NOT NULL
+event_id        TEXT NOT NULL        -- Polymarket event id/slug
+event_title     TEXT                 -- Event title
+event_url       TEXT
+n_legs          INTEGER              -- Number of outcome legs
+sum_asks        REAL                 -- Sum of best_ask across all legs (< 1.0 = arb)
+gap_pct         REAL                 -- (1 - sum_asks) * 100 = raw gap %
+net_profit_pct  REAL                 -- gap_pct - fee_rate*100 = net profit %
+min_liquidity   REAL                 -- Worst-case leg liquidity ($)
+total_usdc      REAL                 -- Total invested across all legs
+fee_usdc        REAL                 -- Estimated fees
+legs_json       TEXT                 -- JSON: [{token_id, question, ask, weight, usdc}]
+winning_leg     TEXT                 -- token_id of YES-resolving leg
+outcome         TEXT                 -- NULL | 'WIN' | 'LOSS'
+resolved_at     TEXT
+pnl_usdc        REAL
+pnl_pct         REAL
+status          TEXT DEFAULT 'open'  -- open | resolved | expired
+```
+
+#### NegRisk config columns (in `config` table)
+```sql
+nr_enabled              INTEGER DEFAULT 1      -- 1=active 0=disabled
+nr_min_gap              REAL    DEFAULT 0.02   -- Min net gap after fees (2%)
+nr_min_leg_liquidity    REAL    DEFAULT 200.0  -- Min liquidity per outcome leg ($)
+nr_max_legs             INTEGER DEFAULT 20     -- Max legs per event to consider
+nr_fee_rate             REAL    DEFAULT 0.02   -- Estimated protocol fee (2%)
+nr_max_position_usdc    REAL    DEFAULT 50.0   -- Max total USDC per basket
+```
+
 ### DB Migrations
 
 `init_db()` runs `ALTER TABLE ... ADD COLUMN` for new columns after table creation. This lets the DB survive deploys without losing data:
@@ -155,6 +193,12 @@ Separate tables for historical backtest results. `trades` rows have `run_id` FK 
 ```python
 migrations = [
     ("config", "max_capital_deployed_pct", "REAL DEFAULT 0.50"),
+    ("config", "nr_enabled",              "INTEGER DEFAULT 1"),
+    ("config", "nr_min_gap",              "REAL DEFAULT 0.02"),
+    ("config", "nr_min_leg_liquidity",    "REAL DEFAULT 200.0"),
+    ("config", "nr_max_legs",             "INTEGER DEFAULT 20"),
+    ("config", "nr_fee_rate",             "REAL DEFAULT 0.02"),
+    ("config", "nr_max_position_usdc",    "REAL DEFAULT 50.0"),
 ]
 for table, column, definition in migrations:
     try:
@@ -273,6 +317,10 @@ FastAPI on port 8765. CORS: `allow_origins=["*"]`.
 | GET | `/runs` | Backtest run list |
 | GET | `/runs/{id}` | Single run |
 | GET | `/runs/{id}/trades` | Trades for a run |
+| GET | `/negrisk/signals` | All NegRisk baskets (params: status, limit, offset) |
+| GET | `/negrisk/signals/open` | Open NegRisk baskets only |
+| GET | `/negrisk/signals/{id}` | Single NegRisk basket detail |
+| GET | `/negrisk/stats` | NegRisk aggregated stats (win rate, PnL, avg gap) |
 
 ### `pid_alive` detection
 Uses `ps -o stat= -p {pid}` and checks for `Z` (zombie). `os.kill(pid, 0)` alone was insufficient — zombie processes don't raise an error but are dead.
@@ -376,6 +424,7 @@ API_URL=http://localhost:8765          # Backend URL for Next.js proxy (optional
 | Settings → wrong page | `href: '/dashboard'` hardcoded | Fixed to `/strategies` |
 | `frontend/src/app/logs/` gitignored | `.gitignore` had `logs/` (matches any subdir) | Changed to `/logs/` (root only) |
 | DB reset on Docker rebuild | DB stored in `/app/` (container layer) | Moved to `/app/data/` (mounted volume) |
+| Signals stay open forever after close | `resolve_pending_signals` queried Gamma API with `clobTokenIds` filter — that filter is silently ignored by the API (returns random 20 markets, never the target) | Switched to `CLOB last-trade-price` endpoint: queries by token_id directly, price ≥ 0.9 = YES win, ≤ 0.1 = NO loss, mid-range = not settled yet (expire after 6h) |
 
 ---
 
@@ -397,7 +446,8 @@ API_URL=http://localhost:8765          # Backend URL for Next.js proxy (optional
    new_param: Optional[float] = None
    ```
 4. **`frontend/src/types/index.ts`** — Add to `BotConfig` interface
-5. **`frontend/src/components/strategies/BondHunterCard.tsx`** — Add to `PARAM_META` array
+5. **`frontend/src/components/strategies/BondHunterCard.tsx`** — Add to `PARAM_META` array (Bond Hunter params)
+   **OR** `frontend/src/components/strategies/NegRiskHunterCard.tsx` — Add to `PARAM_META` (NegRisk params, prefix `nr_`)
 
 ---
 

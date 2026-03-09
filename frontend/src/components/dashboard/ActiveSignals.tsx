@@ -17,15 +17,17 @@ export function ActiveSignals({ signals }: ActiveSignalsProps) {
         <Badge variant="open" label={`● ${signals.length} open`} />
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-        {signals.length === 0 ? (
-          <div style={{
-            fontFamily: 'var(--mono)', fontSize: 11,
-            color: 'var(--text3)', padding: '20px 0',
-          }}>No active signals</div>
-        ) : (
-          signals.map(s => <SignalCard key={s.id} signal={s} />)
-        )}
+      <div style={{ maxHeight: 572, overflowY: 'auto', paddingRight: 4 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {signals.length === 0 ? (
+            <div style={{
+              fontFamily: 'var(--mono)', fontSize: 11,
+              color: 'var(--text3)', padding: '20px 0',
+            }}>No active signals</div>
+          ) : (
+            signals.map(s => <SignalCard key={s.id} signal={s} />)
+          )}
+        </div>
       </div>
     </div>
   )
