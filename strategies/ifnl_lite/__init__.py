@@ -10,8 +10,7 @@ with 5-20 minute holding periods.
 Lite simplifications vs full spec:
 - Offline wallet profiling only (no real-time wallet scoring)
 - Delayed wallet identification via REST polling (~15s)
-- Paper trading execution (no maker-first)
-- Single TP/SL (no scaled exits or pyramiding)
+- Paper trading execution with trailing stops (no maker-first, no pyramiding)
 """
 
 import json
@@ -33,19 +32,19 @@ class IfnlLiteStrategy(BaseStrategy):
     def default_config(self) -> dict:
         return {
             # Market selection
-            "min_24h_volume": 50000,
-            "min_open_interest": 100000,
+            "min_24h_volume": 30000,         # was 50k — more markets eligible
+            "min_open_interest": 50000,      # was 100k — less restrictive
             "max_spread_bps": 250,
             "min_ttr_hours": 6,
             "max_ttr_days": 45,
             "min_top_level_liquidity_usd": 1500,
-            "max_monitored_markets": 10,
+            "max_monitored_markets": 20,     # was 10 — more opportunities
             # Signal thresholds
-            "min_signal_to_enter": 0.72,
-            "min_divergence_bps": 18,
+            "min_signal_to_enter": 0.68,     # was 0.72 — allow more signals
+            "min_divergence_bps": 14,        # was 18 — capture smaller divergences
             "min_active_informed_wallets": 2,
             "min_informed_score": 0.65,
-            "min_book_imbalance": 0.15,
+            "min_book_imbalance": 0.12,      # was 0.15 — slightly relaxed
             # Position sizing
             "base_position_pct": 0.10,
             "max_position_pct": 0.15,
@@ -53,9 +52,10 @@ class IfnlLiteStrategy(BaseStrategy):
             "max_total_deployed_pct": 0.50,
             # Exit rules
             "tp_capture_ratio": 0.80,
-            "hard_stop_bps": 22,
+            "hard_stop_bps": 22,             # base stop — adaptive SL scales with divergence
             "max_hold_minutes": 20,
-            "min_progress_bps_after_5m": 6,
+            "min_progress_bps_after_5m": 4,  # was 6 — less aggressive early exit
+            "early_exit_check_min": 8,       # was implicit 5 — give signals more time
             "max_informed_flow_decay_seconds": 90,
             "market_cooldown_after_stop_min": 10,
             # IFS parameters

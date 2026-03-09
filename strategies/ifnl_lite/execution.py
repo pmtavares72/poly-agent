@@ -69,8 +69,12 @@ class ExecutionManager:
         # Compute TP/SL targets
         expected_move_bps = signal.expected_move  # already in bps
         tp_ratio = self.config.get("tp_capture_ratio", 0.80)
-        hard_stop = self.config.get("hard_stop_bps", 22)
+        hard_stop_base = self.config.get("hard_stop_bps", 22)
         max_hold = self.config.get("max_hold_minutes", 20)
+
+        # Adaptive SL: at least hard_stop_base, but scale with expected move
+        # so bigger divergence signals get proportionally wider stops
+        hard_stop = max(hard_stop_base, expected_move_bps * 1.2)
 
         if signal.direction == "YES":
             tp_target = entry_price + (expected_move_bps * tp_ratio / 10000)
@@ -143,34 +147,54 @@ class ExecutionManager:
             exit_reason = None
             exit_price = current_mid
 
+            # Compute directional progress
+            if direction == "YES":
+                progress = current_mid - entry_price
+            else:
+                progress = entry_price - current_mid
+            tp_distance = abs(tp_target - entry_price) if tp_target else 0
+            progress_ratio = progress / tp_distance if tp_distance > 0 else 0
+
             # 1. Take profit
             if direction == "YES" and current_mid >= tp_target:
                 exit_reason = "tp"
             elif direction == "NO" and current_mid <= tp_target:
                 exit_reason = "tp"
 
-            # 2. Hard stop
-            if direction == "YES" and current_mid <= sl_target:
-                exit_reason = "sl"
-            elif direction == "NO" and current_mid >= sl_target:
-                exit_reason = "sl"
+            # 2. Trailing stop: after reaching 50% of TP, move stop to breakeven
+            #    After reaching 70% of TP, trail stop at 50% of current profit
+            effective_sl = sl_target
+            if progress_ratio >= 0.7 and exit_reason is None:
+                # Trail stop at 50% of current profit
+                trail_offset = progress * 0.5
+                if direction == "YES":
+                    effective_sl = max(sl_target, entry_price + trail_offset)
+                else:
+                    effective_sl = min(sl_target, entry_price - trail_offset)
+            elif progress_ratio >= 0.5 and exit_reason is None:
+                # Move stop to breakeven
+                effective_sl = entry_price
 
-            # 3. Time stop
+            # 3. Hard stop (using effective SL which may have been trailed)
+            if exit_reason is None:
+                if direction == "YES" and current_mid <= effective_sl:
+                    exit_reason = "sl" if effective_sl == sl_target else "trail_sl"
+                elif direction == "NO" and current_mid >= effective_sl:
+                    exit_reason = "sl" if effective_sl == sl_target else "trail_sl"
+
+            # 4. Time stop
             max_hold = sig["time_limit_min"] or self.config.get("max_hold_minutes", 20)
             if elapsed_min >= max_hold:
                 exit_reason = "time"
 
-            # 4. Early exit: after 5 min, check progress
-            min_progress = self.config.get("min_progress_bps_after_5m", 6) / 10000
-            if elapsed_min >= 5 and exit_reason is None:
-                if direction == "YES":
-                    progress = current_mid - entry_price
-                else:
-                    progress = entry_price - current_mid
+            # 5. Early exit: after 8 min, check progress (relaxed from 5 min / 6 bps)
+            min_progress = self.config.get("min_progress_bps_after_5m", 4) / 10000
+            early_check_min = self.config.get("early_exit_check_min", 8)
+            if elapsed_min >= early_check_min and exit_reason is None:
                 if progress < min_progress:
                     exit_reason = "time"
 
-            # 5. Invalidation: book imbalance flip
+            # 6. Invalidation: book imbalance flip
             if exit_reason is None:
                 features = self.micro.get_features(token_id)
                 book_imb = features["book_imbalance"]
@@ -184,7 +208,7 @@ class ExecutionManager:
                 else:
                     self._invalidation_counts[sig_id] = 0
 
-            # 6. Invalidation: informed flow decay
+            # 7. Invalidation: informed flow decay
             if exit_reason is None:
                 max_decay = self.config.get("max_informed_flow_decay_seconds", 90)
                 min_score = self.config.get("min_informed_score", 0.65)
@@ -215,7 +239,7 @@ class ExecutionManager:
                 ))
                 conn.commit()
 
-                # Set cooldown if stop or invalidation
+                # Set cooldown if stop or invalidation (not trail_sl — that's profit protection)
                 if exit_reason in ("sl", "invalidation"):
                     self.signal_engine.set_cooldown(token_id)
 
@@ -237,17 +261,33 @@ class ExecutionManager:
         return exits
 
     def _size_position(self, signal: Signal, capital: float, available: float) -> float:
-        """Position sizing: capital * base_pct * strength * liquidity_factor."""
+        """
+        Position sizing with tiered scaling by signal strength:
+        - Weak signals (0.65-0.72): base_pct * 0.8
+        - Standard signals (0.72-0.80): base_pct * 1.0
+        - Strong signals (0.80+): scales up to max_pct
+        """
         base_pct = self.config.get("base_position_pct", 0.10)
         max_pct = self.config.get("max_position_pct", 0.15)
         min_pos = self.config.get("min_position_usdc", 5.0)
+
+        # Tiered strength multiplier
+        strength = signal.signal_strength
+        if strength >= 0.80:
+            # Strong signal: scale from base_pct up to max_pct
+            pct = base_pct + (max_pct - base_pct) * min(1.0, (strength - 0.80) / 0.20)
+        elif strength >= 0.72:
+            pct = base_pct
+        else:
+            # Weaker signal (still above min threshold): reduce size
+            pct = base_pct * 0.8
 
         # Liquidity factor from market info
         info = self.signal_engine._market_info.get(signal.token_id, {})
         liquidity = info.get("liquidity", 3000)
         liquidity_factor = max(0.5, min(1.5, liquidity / 3000))
 
-        position = capital * base_pct * signal.signal_strength * liquidity_factor
+        position = capital * pct * liquidity_factor
 
         # Hard limits
         position = min(position, capital * max_pct)

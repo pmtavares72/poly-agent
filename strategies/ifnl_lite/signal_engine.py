@@ -29,13 +29,14 @@ class InformedFlowAccumulator:
     flows: list = field(default_factory=list)
 
     def add(self, size_usd: float, informed_score: float, reliability: float,
-            direction: str, ts: float = None):
+            direction: str, wallet: str = "", ts: float = None):
         self.flows.append({
             "ts": ts or time.time(),
             "size_usd": size_usd,
             "informed_score": informed_score,
             "reliability": reliability,
             "direction": direction,
+            "wallet": wallet,
         })
 
     def ifs(self, direction: str, window_sec: float) -> float:
@@ -49,13 +50,14 @@ class InformedFlowAccumulator:
 
     def active_informed_wallets(self, direction: str, window_sec: float,
                                  min_score: float) -> int:
-        """Count unique informed wallets active in window (approximate by flow entries)."""
+        """Count unique informed wallets active in window."""
         cutoff = time.time() - window_sec
-        return sum(
-            1 for f in self.flows
-            if f["ts"] >= cutoff and f["direction"] == direction
-            and f["informed_score"] >= min_score
-        )
+        wallets = set()
+        for f in self.flows:
+            if f["ts"] >= cutoff and f["direction"] == direction \
+                    and f["informed_score"] >= min_score and f.get("wallet"):
+                wallets.add(f["wallet"])
+        return len(wallets)
 
     def last_informed_trade_ts(self, direction: str, min_score: float) -> float:
         """Timestamp of the most recent informed trade in a direction."""
@@ -148,6 +150,7 @@ class SignalEngine:
                 informed_score=informed_score,
                 reliability=reliability,
                 direction=direction,
+                wallet=trade.proxy_wallet,
             )
 
             # Enrich microstructure with trade size

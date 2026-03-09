@@ -110,7 +110,8 @@ polyagent/
 │   ├── frontend.log
 │   ├── agent.log
 │   ├── ifnl_lite.log
-│   └── ifnl_lite.pid
+│   ├── ifnl_lite.pid
+│   └── ifnl_lite_status.json   # Métricas live del runner (cada 10s)
 └── frontend/
     ├── next.config.mjs   # Proxy /api/* → localhost:8765
     └── src/
@@ -177,6 +178,7 @@ sqlite3 data/polyagent.db < migrations.sql
 | GET | `/strategies/{slug}/signals` | Señales de la estrategia |
 | GET | `/strategies/{slug}/signals/open` | Señales abiertas |
 | GET | `/strategies/{slug}/stats` | Stats específicos |
+| GET | `/strategies/{slug}/activity` | Métricas live del engine (lee status file) |
 
 ### Legacy Bond Hunter
 
@@ -314,6 +316,47 @@ AND al menos 2 wallets informados activos (informed_score >= 0.65)
 - **Time Stop:** > 20 min holding (o < 6 bps progress después de 5 min)
 - **Invalidation:** book flip o flow decay (sin trades informados 90s)
 - **Cooldown:** 10 min per market tras stop/invalidation
+
+---
+
+## Monitorización en Tiempo Real
+
+### Engine Activity Panel
+
+Cuando IFNL-Lite está activo, el dashboard muestra un panel **Engine Activity** con métricas live:
+
+- **Process:** Running / Offline
+- **Uptime:** tiempo desde arranque
+- **WebSocket:** estado de conexión
+- **Markets:** número de mercados monitorizados + nombres
+- **Book States:** estados de libro de órdenes activos
+- **Trades Captured:** trades procesados desde el data poller
+- **Wallets Seen:** wallets únicos identificados
+- **Flow Entries:** entradas en el acumulador de flujo
+- **Signals Generated:** señales producidas
+
+### Cómo funciona
+
+1. El runner escribe `logs/ifnl_lite_status.json` cada 10 segundos con todas las métricas
+2. La API lee ese fichero en `GET /strategies/ifnl_lite/activity`
+3. Si el fichero tiene >60s sin actualizarse, la API marca `possibly_stale: true`
+4. El frontend (`IfnlActivityPanel`) poll cada 10s vía SWR y muestra indicador "● LIVE" (verde) o "○ OFFLINE" (gris)
+
+### Verificar que IFNL funciona
+
+```bash
+# Verificar que el runner está corriendo
+cat logs/ifnl_lite.pid && ps -p $(cat logs/ifnl_lite.pid)
+
+# Ver métricas live
+cat logs/ifnl_lite_status.json | python3 -m json.tool
+
+# Ver logs del runner
+tail -f logs/ifnl_lite.log
+
+# Verificar desde la API
+curl http://localhost:8765/strategies/ifnl_lite/activity | python3 -m json.tool
+```
 
 ---
 

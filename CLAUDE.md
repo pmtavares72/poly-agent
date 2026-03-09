@@ -45,6 +45,8 @@ polyagent/
 ├── data/                 # Persistent data (gitignored)
 │   └── polyagent.db
 ├── logs/                 # Runtime logs (gitignored)
+│   ├── ifnl_lite_status.json  # Live engine metrics (written by runner every 10s)
+│   └── ifnl_lite.pid          # Runner PID (written by API on enable)
 └── frontend/
     ├── next.config.mjs   # Next.js config — proxy /api/* → localhost:8765
     ├── src/
@@ -236,6 +238,7 @@ FastAPI on port 8765. CORS: `allow_origins=["*"]`.
 | **GET** | **`/strategies/{slug}/signals`** | **Strategy signals** |
 | **GET** | **`/strategies/{slug}/signals/open`** | **Open signals** |
 | **GET** | **`/strategies/{slug}/stats`** | **Strategy stats** |
+| **GET** | **`/strategies/{slug}/activity`** | **Live engine activity (reads status file)** |
 | GET | `/runs`, `/runs/{id}`, `/runs/{id}/trades` | Backtest data |
 
 ---
@@ -311,6 +314,20 @@ python3 -m strategies.ifnl_lite.ifnl_runner --db data/polyagent.db
 ```
 Starts continuous process: WsClient + DataApiClient + signal/exit loops.
 
+### Live Activity Monitoring
+
+The runner writes `logs/ifnl_lite_status.json` every 10 seconds with live metrics:
+```json
+{
+  "running": true, "uptime_seconds": 300, "ws_connected": true,
+  "markets_monitored": 10, "market_names": ["Will X..."],
+  "trades_captured": 1200, "unique_wallets_seen": 85,
+  "signals_generated": 3, "book_states": 10, "active_flow_entries": 42
+}
+```
+
+The API reads this file via `GET /strategies/{slug}/activity`. If the file is >60s old, it adds `possibly_stale: true`. The frontend `IfnlActivityPanel` component polls this every 10s and shows a live metrics grid with color-coded status indicators.
+
 ---
 
 ## Frontend: Next.js
@@ -341,6 +358,7 @@ rewrites() {
 
 - **`BondHunterCard`** — Bond Hunter config with editable params, save button
 - **`IfnlLiteCard`** — IFNL-Lite config (5 sections: market selection, signal thresholds, position sizing, exit rules, IFS params), start/stop toggle, wallet stats
+- **`IfnlActivityPanel`** — Live engine metrics grid (in IfnlDashboard): trades captured, wallets seen, markets monitored, WebSocket status, book states, flow entries, signals generated. Shows "LIVE"/"OFFLINE" indicator + staleness detection.
 - **`BotControl`** — Start/stop bot, Scan Now button
 - **`KpiGrid`** / **`PnlChart`** / **`ActiveSignals`** / **`RecentSignalsTable`**
 - **`AppShell`** / **`Sidebar`** / **`TickerTape`**
@@ -355,6 +373,7 @@ useBot()             // 5s refresh  → /bot
 useConfig()          // → /config + saveConfig()
 useStrategies()      // 30s refresh → /strategies
 useStrategy(slug)    // 30s refresh → /strategies/{slug}
+useStrategyActivity(slug)  // 10s refresh → /strategies/{slug}/activity
 useAuth()            // localStorage auth check
 ```
 
@@ -368,10 +387,11 @@ useAuth()            // localStorage auth check
 
 ### start.sh flow
 1. Install Python deps (`pip install -r requirements.txt`)
-2. Init DB: `python3 agent.py --mode paper --force`
+2. Init DB: `python3 agent.py --mode paper --force` + apply `migrations.sql`
 3. Start API: `uvicorn api:app --host 0.0.0.0 --port 8765` (background)
 4. `npm install && npm run build && npm start --port 3000` (background)
 5. Add cron: `*/15 * * * * python3 agent.py --mode paper`
+6. Auto-start IFNL-Lite runner if `enabled=1` in DB (PID saved to `logs/ifnl_lite.pid`)
 
 ### Environment variables
 
