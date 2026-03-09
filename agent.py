@@ -1273,7 +1273,7 @@ def run_negrisk_scan(params: dict, conn: sqlite3.Connection) -> dict:
         event_url = f"https://polymarket.com/event/{event_slug}" if event_slug else ""
         markets = event.get("markets", [])
 
-        if len(markets) < 2:
+        if len(markets) < 3:
             skipped_legs += 1
             continue
         if len(markets) > nr_max_legs:
@@ -1282,9 +1282,9 @@ def run_negrisk_scan(params: dict, conn: sqlite3.Connection) -> dict:
 
         checked += 1
 
-        # Comprobar si ya tenemos esta señal abierta
+        # Comprobar si ya tenemos esta señal (cualquier estado) para evitar duplicados
         cur = conn.cursor()
-        cur.execute("SELECT id FROM negrisk_signals WHERE event_id=? AND status='open'", (event_id,))
+        cur.execute("SELECT id FROM negrisk_signals WHERE event_id=?", (event_id,))
         if cur.fetchone():
             skipped_exists += 1
             continue
@@ -1307,7 +1307,9 @@ def run_negrisk_scan(params: dict, conn: sqlite3.Connection) -> dict:
             except (TypeError, ValueError, IndexError):
                 yes_price = None
 
-            if yes_price is None or yes_price <= 0.001 or yes_price >= 0.999:
+            # Filtrar precios near-zero (mercados ilíquidos/inactivos) y precios >= 0.99
+            # Un precio <0.02 significa el outcome es considerado casi imposible — no es arb real
+            if yes_price is None or yes_price < 0.02 or yes_price >= 0.99:
                 valid = False
                 break
 
