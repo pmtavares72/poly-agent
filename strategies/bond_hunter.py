@@ -562,7 +562,8 @@ def run_paper(conn: sqlite3.Connection, config: dict):
 
         if available_capital < 5.0:
             break
-        position_usdc = kelly_size(available_capital, current_price, ask_price, kelly_fraction, max_position_pct)
+        position_usdc = kelly_size(capital, current_price, ask_price, kelly_fraction, max_position_pct)
+        position_usdc = min(position_usdc, available_capital)  # can't exceed available
         available_capital -= position_usdc
         shares = position_usdc / ask_price
         protocol_fee = position_usdc * fee_rate
