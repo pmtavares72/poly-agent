@@ -22,7 +22,7 @@ echo "======================================"
 
 # ── 1. Dependencias Python ──────────────────
 echo ""
-echo "[1/5] Checking Python dependencies..."
+echo "[1/6] Checking Python dependencies..."
 PYTHON_BIN=$(which python3 2>/dev/null || which python)
 if [ -z "$PYTHON_BIN" ]; then
   echo "ERROR: python3 not found. Install it with: apt install python3 python3-pip"
@@ -35,15 +35,22 @@ echo "      ✓ Python deps OK"
 
 # ── 2. Inicializar BD y config ─────────────
 echo ""
-echo "[2/5] Initializing database..."
+echo "[2/6] Initializing database..."
 $PYTHON_BIN agent.py --mode paper --force 2>/dev/null || true
 # Nota: fuerza la creación de tablas aunque el bot esté disabled
 # El --force hace que ejecute aunque enabled=0
-echo "      ✓ Database initialized (polyagent.db)"
+echo "      ✓ Base tables initialized"
+
+# Apply migrations (strategies, IFNL tables, seed data)
+if [ -f "$SCRIPT_DIR/migrations.sql" ]; then
+  sqlite3 "$POLYAGENT_DB" < "$SCRIPT_DIR/migrations.sql" 2>/dev/null || true
+  echo "      ✓ Migrations applied (migrations.sql)"
+fi
+echo "      ✓ Database ready ($POLYAGENT_DB)"
 
 # ── 3. Arrancar API FastAPI ─────────────────
 echo ""
-echo "[3/5] Starting FastAPI server on port 8765..."
+echo "[3/6] Starting FastAPI server on port 8765..."
 pkill -f "uvicorn api:app" 2>/dev/null || true
 sleep 1
 nohup $PYTHON_BIN -m uvicorn api:app --host 0.0.0.0 --port 8765 \
@@ -54,7 +61,7 @@ echo "        Swagger: http://localhost:8765/docs"
 
 # ── 4. Arrancar Next.js frontend ───────────
 echo ""
-echo "[4/5] Building & starting Next.js frontend..."
+echo "[4/6] Building & starting Next.js frontend..."
 cd frontend
 
 # Detectar IP para mostrar en el resumen (el proxy de Next.js hace que no sea necesaria para la API)
@@ -73,13 +80,50 @@ echo "        App: http://${SERVER_IP}:3000"
 
 # ── 5. Configurar cron ─────────────────────
 echo ""
-echo "[5/5] Configuring cron job (every 15 min)..."
+echo "[5/6] Configuring cron job (every 15 min)..."
 CRON_CMD="*/15 * * * * cd $SCRIPT_DIR && $PYTHON_BIN $SCRIPT_DIR/agent.py --mode paper >> $LOG_DIR/agent.log 2>&1"
 
 # Añadir solo si no existe ya
 ( crontab -l 2>/dev/null | grep -v "agent.py"; echo "$CRON_CMD" ) | crontab -
 echo "      ✓ Cron configured"
 echo "        Log: $LOG_DIR/agent.log"
+
+# ── 6. Auto-start enabled continuous strategies ──
+echo ""
+echo "[6/6] Checking for enabled continuous strategies..."
+# Query DB for IFNL-Lite enabled status
+IFNL_ENABLED=$($PYTHON_BIN -c "
+import sqlite3, os
+db = os.environ.get('POLYAGENT_DB', '$POLYAGENT_DB')
+try:
+    conn = sqlite3.connect(db)
+    cur = conn.execute(\"SELECT enabled FROM strategies WHERE slug='ifnl_lite'\")
+    row = cur.fetchone()
+    conn.close()
+    print(row[0] if row else 0)
+except:
+    print(0)
+" 2>/dev/null || echo "0")
+
+if [ "$IFNL_ENABLED" = "1" ]; then
+  echo "      IFNL-Lite is enabled — starting runner..."
+  # Kill any existing runner
+  if [ -f "$LOG_DIR/ifnl_lite.pid" ]; then
+    kill $(cat "$LOG_DIR/ifnl_lite.pid") 2>/dev/null || true
+    rm -f "$LOG_DIR/ifnl_lite.pid"
+  fi
+  pkill -f "ifnl_runner" 2>/dev/null || true
+  sleep 1
+  nohup $PYTHON_BIN -m strategies.ifnl_lite.ifnl_runner --db "$POLYAGENT_DB" \
+    >> "$LOG_DIR/ifnl_lite.log" 2>&1 &
+  IFNL_PID=$!
+  echo "$IFNL_PID" > "$LOG_DIR/ifnl_lite.pid"
+  echo "      ✓ IFNL-Lite runner started (pid=$IFNL_PID)"
+  echo "        Log: $LOG_DIR/ifnl_lite.log"
+else
+  echo "      IFNL-Lite is disabled — skipping"
+  echo "      (Enable it from the dashboard to start)"
+fi
 
 # ── Resumen ────────────────────────────────
 echo ""
@@ -94,6 +138,7 @@ echo "  Logs:"
 echo "    API:      tail -f $LOG_DIR/api.log"
 echo "    Frontend: tail -f $LOG_DIR/frontend.log"
 echo "    Agent:    tail -f $LOG_DIR/agent.log"
+echo "    IFNL:     tail -f $LOG_DIR/ifnl_lite.log"
 echo ""
 echo "  To stop all:"
 echo "    bash stop.sh"

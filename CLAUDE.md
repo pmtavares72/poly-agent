@@ -2,18 +2,17 @@
 
 ## Overview
 
-PolyAgent is a Polymarket prediction market trading bot with two independent paper-trading strategies:
+PolyAgent is a Polymarket prediction market trading bot with a **multi-strategy architecture**. Each strategy runs independently with its own capital, config, signals table, and enable/disable control. Runs in paper trading mode with real market data but no real capital.
 
-1. **Bond Hunter** — Buys YES tokens in binary markets at 0.95–0.995, holds until resolution (~48h), exits at 1.0 for small consistent returns.
-2. **NegRisk Arb Hunter** — Scans NegRisk multi-outcome events (e.g. "Who wins the Premier League?") where the sum of all YES prices < 1.0. Buys proportionally across every outcome — one always resolves YES at $1, locking in a risk-free spread. Sports markets are underexplored by other bots.
-
-Both strategies run in paper trading mode (real market data, no real capital). Each has its own config parameters, DB tables, and P&L tracking.
+**Strategies:**
+- **Bond Hunter** (cron, every 15 min) — Buys YES tokens at 0.95–0.995 in near-certain markets, holds until resolution (~48h), exits at 1.0 for small consistent returns.
+- **IFNL-Lite** (continuous, WebSocket) — Detects divergence between informed trade flow and price movement. Uses offline wallet profiling + real-time microstructure. Holds 5–20 minutes.
 
 **Stack:**
 - Backend: Python 3 — FastAPI + SQLite
 - Frontend: TypeScript/React — Next.js 14 + SWR + Recharts
 - Deployment: Bash + cron (OpenClaw Docker)
-- External APIs: Polymarket Gamma API + CLOB Prices API
+- External APIs: Polymarket Gamma API + CLOB Prices API + Data API + WebSocket
 
 ---
 
@@ -21,25 +20,40 @@ Both strategies run in paper trading mode (real market data, no real capital). E
 
 ```
 polyagent/
-├── agent.py              # Core trading engine (strategy, DB, paper + backtest)
+├── agent.py              # DB init, strategy dispatch, CLI, backtest
 ├── api.py                # FastAPI REST server (port 8765)
 ├── backtest.py           # Standalone historical backtest runner
-├── requirements.txt      # Python deps: fastapi, uvicorn, requests, rich, pydantic
+├── migrations.sql        # All DB schema changes for OpenClaw deployment
+├── requirements.txt      # Python deps
 ├── start.sh              # Full orchestration: deps → DB init → API → Frontend → cron
 ├── stop.sh               # Kill API + frontend + remove cron
 ├── CLAUDE.md             # This file
-├── data/                 # Persistent data (gitignored) — DB lives here locally
-│   └── polyagent.db      # SQLite database (paper trading)
+├── strategies/
+│   ├── __init__.py       # Strategy registry (STRATEGY_REGISTRY dict)
+│   ├── base.py           # BaseStrategy ABC
+│   ├── bond_hunter.py    # Bond Hunter implementation
+│   └── ifnl_lite/
+│       ├── __init__.py       # IfnlLiteStrategy class
+│       ├── ws_client.py      # WebSocket client (order book, trades)
+│       ├── data_api.py       # REST poller for wallet-attributed trades
+│       ├── market_selector.py # Market universe filtering
+│       ├── microstructure.py  # Book imbalance, absorption, drift
+│       ├── signal_engine.py   # IFS computation, divergence detection
+│       ├── execution.py       # Paper trading position management
+│       ├── wallet_profiler.py # Offline wallet scoring (daily)
+│       └── ifnl_runner.py     # Continuous process runner
+├── data/                 # Persistent data (gitignored)
+│   └── polyagent.db
 ├── logs/                 # Runtime logs (gitignored)
-│   ├── api.log
-│   ├── frontend.log
-│   └── agent.log
 └── frontend/
     ├── next.config.mjs   # Next.js config — proxy /api/* → localhost:8765
     ├── src/
     │   ├── app/          # Pages (app router)
-    │   ├── components/   # React components
-    │   ├── hooks/        # SWR data-fetching hooks
+    │   ├── components/
+    │   │   ├── dashboard/   # KpiGrid, PnlChart, BotControl, etc.
+    │   │   ├── layout/      # AppShell, Sidebar
+    │   │   └── strategies/  # BondHunterCard, IfnlLiteCard
+    │   ├── hooks/        # SWR hooks (useStats, useStrategies, etc.)
     │   ├── lib/          # api.ts, auth.ts, format.ts
     │   └── types/        # TypeScript interfaces
     └── ...
@@ -47,249 +61,149 @@ polyagent/
 
 ---
 
+## Multi-Strategy Architecture
+
+### Strategy Base Class (`strategies/base.py`)
+
+```python
+class BaseStrategy(ABC):
+    slug: str       # 'bond_hunter', 'ifnl_lite'
+    name: str       # Display name
+    strategy_type: str  # 'cron' | 'continuous'
+
+    def init_tables(self, conn): ...
+    def run(self, conn, config): ...
+    def resolve_signals(self, conn) -> int: ...
+    def get_signals(self, conn, status, limit, offset) -> dict: ...
+    def get_stats(self, conn) -> dict: ...
+    def default_config(self) -> dict: ...
+```
+
+### Strategy Registry (`strategies/__init__.py`)
+
+```python
+STRATEGY_REGISTRY = {
+    'bond_hunter': BondHunterStrategy,
+    'ifnl_lite': IfnlLiteStrategy,
+}
+```
+
+### Per-Strategy Config
+
+Each strategy stores its config as JSON in `strategies.config_json`. Default config is defined by `strategy.default_config()`. Config is merged with defaults on load.
+
+### Strategy Types
+
+- **cron** — Runs on schedule via `agent.py --strategy <slug>`. Bond Hunter runs every 15 min.
+- **continuous** — Runs as a persistent process. IFNL-Lite uses `ifnl_runner.py` with WebSocket + polling loop.
+
+---
+
 ## Database
 
 ### Location & Persistence
 
-The DB path is controlled by the `POLYAGENT_DB` environment variable:
+Controlled by `POLYAGENT_DB` environment variable:
 
 | Environment | Path | Set by |
 |-------------|------|--------|
-| Docker/OpenClaw | `/app/data/polyagent.db` | Default (env var not set) |
-| Local (start.sh) | `$SCRIPT_DIR/data/polyagent.db` | `start.sh` exports `POLYAGENT_DB` |
+| Docker/OpenClaw | `/app/data/polyagent.db` | Default |
+| Local (start.sh) | `$SCRIPT_DIR/data/polyagent.db` | `start.sh` |
 | Custom | Any path | `export POLYAGENT_DB=/my/path/db` |
-
-**In OpenClaw**, `docker-compose.yml` mounts `./data:/app/data` as a persistent volume. The DB survives container rebuilds because it lives in that volume, not in the container image.
-
-**In agent.py:**
-```python
-DB_PATH = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.db")
-
-def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
-```
-
-**In api.py:**
-```python
-DB_PATH = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.db")
-```
 
 ### Schema
 
-#### `config` (singleton, id=1)
-All bot strategy parameters, editable via API and frontend Settings.
+#### `strategies` (one row per strategy)
+```sql
+slug        TEXT PRIMARY KEY       -- 'bond_hunter', 'ifnl_lite'
+name        TEXT NOT NULL
+type        TEXT NOT NULL           -- 'cron' | 'continuous'
+enabled     INTEGER DEFAULT 0
+capital     REAL DEFAULT 0
+config_json TEXT DEFAULT '{}'       -- strategy-specific params as JSON
+created_at  TEXT
+updated_at  TEXT
+```
 
+#### `config` (singleton, id=1) — Bond Hunter legacy config
 ```sql
 id                       INTEGER PRIMARY KEY DEFAULT 1
 initial_capital          REAL    DEFAULT 500.0
 min_probability          REAL    DEFAULT 0.95
 max_probability          REAL    DEFAULT 0.995
-min_profit_net           REAL    DEFAULT 0.015   -- 1.5% min net profit
+min_profit_net           REAL    DEFAULT 0.015
 max_hours_to_close       REAL    DEFAULT 48.0
 min_liquidity_usdc       REAL    DEFAULT 500.0
 kelly_fraction           REAL    DEFAULT 0.25
-max_position_pct         REAL    DEFAULT 0.15    -- max 15% capital per trade
-max_capital_deployed_pct REAL    DEFAULT 0.50    -- max 50% total deployed
+max_position_pct         REAL    DEFAULT 0.15
+max_capital_deployed_pct REAL    DEFAULT 0.50
 fee_rate                 REAL    DEFAULT 0.005
 scan_interval_min        INTEGER DEFAULT 15
 updated_at               TEXT
 ```
 
-#### `bot_status` (singleton, id=1)
+#### `signals` (Bond Hunter paper trading)
 ```sql
-id              INTEGER PRIMARY KEY DEFAULT 1
-enabled         INTEGER DEFAULT 0    -- 0=stopped, 1=active
-pid             INTEGER              -- PID of running scan process
-last_scan_at    TEXT
-next_scan_at    TEXT
-last_error      TEXT
-scan_count      INTEGER DEFAULT 0
+id, detected_at, token_id, question, market_url, closes_at, hours_to_close,
+entry_price, ask_price, spread_entry_pct, net_profit_pct, position_usdc,
+shares, protocol_fee, breakeven_price, liquidity, volume_24h, wash_score,
+outcome, resolved_at, pnl_usdc, pnl_pct, status
 ```
 
-#### `signals` (paper trading, one row per detected opportunity)
+#### `ifnl_signals` (IFNL-Lite signals)
 ```sql
-id              INTEGER PRIMARY KEY AUTOINCREMENT
-detected_at     TEXT NOT NULL
-token_id        TEXT NOT NULL        -- Polymarket CLOB token ID
-question        TEXT
-market_url      TEXT
-closes_at       TEXT
-hours_to_close  REAL
-entry_price     REAL                 -- current price when detected
-ask_price       REAL                 -- entry + spread/2
-spread_entry_pct REAL
-net_profit_pct  REAL                 -- (1 - ask) - fee_rate
-position_usdc   REAL                 -- capital allocated (Kelly-sized)
-shares          REAL                 -- tokens = position / ask
-protocol_fee    REAL
-breakeven_price REAL                 -- ask + fee_rate
-liquidity       REAL
-volume_24h      REAL
-wash_score      TEXT
-outcome         TEXT                 -- NULL (open) | 'YES' | 'NO'
-resolved_at     TEXT
-pnl_usdc        REAL
-pnl_pct         REAL
-status          TEXT DEFAULT 'open'  -- open | resolved | expired
+id, detected_at, token_id, question, market_url, direction, signal_strength,
+entry_mid, entry_price, exit_price, position_usdc, informed_flow, divergence,
+book_imbalance, tp_target, sl_target, time_limit_min, resolved_at,
+pnl_usdc, pnl_pct, exit_reason, status
 ```
 
-#### `scan_log` (one row per cron execution)
+#### `ifnl_wallet_profiles` (pre-computed wallet scores)
 ```sql
-id               INTEGER PRIMARY KEY AUTOINCREMENT
-started_at       TEXT NOT NULL
-finished_at      TEXT
-duration_sec     REAL
-markets_fetched  INTEGER DEFAULT 0
-markets_checked  INTEGER DEFAULT 0   -- passed passes_basic_filters()
-signals_found    INTEGER DEFAULT 0   -- new signals inserted
-signals_resolved INTEGER DEFAULT 0
-skipped_wash     INTEGER DEFAULT 0
-skipped_spread   INTEGER DEFAULT 0
-skipped_no_data  INTEGER DEFAULT 0
-skipped_price    INTEGER DEFAULT 0
-error            TEXT
-mode             TEXT DEFAULT 'paper'
+proxy_wallet (PK), total_trades, n_markets, avg_trade_size,
+pnl_markout_5m, pnl_markout_30m, pnl_markout_2h,
+informed_score, noise_score, reliability, last_updated
 ```
 
-#### `runs` + `trades` (backtest only)
-Separate tables for historical backtest results. `trades` rows have `run_id` FK to `runs`. Not used by paper trading.
-
-#### `negrisk_signals` (NegRisk Arb, one row per detected basket)
+#### `ifnl_wallet_trades` (historical trades for profiling)
 ```sql
-id              INTEGER PRIMARY KEY AUTOINCREMENT
-detected_at     TEXT NOT NULL
-event_id        TEXT NOT NULL        -- Polymarket event id/slug
-event_title     TEXT                 -- Event title
-event_url       TEXT
-n_legs          INTEGER              -- Number of outcome legs
-sum_asks        REAL                 -- Sum of best_ask across all legs (< 1.0 = arb)
-gap_pct         REAL                 -- (1 - sum_asks) * 100 = raw gap %
-net_profit_pct  REAL                 -- gap_pct - fee_rate*100 = net profit %
-min_liquidity   REAL                 -- Worst-case leg liquidity ($)
-total_usdc      REAL                 -- Total invested across all legs
-fee_usdc        REAL                 -- Estimated fees
-legs_json       TEXT                 -- JSON: [{token_id, question, ask, weight, usdc}]
-winning_leg     TEXT                 -- token_id of YES-resolving leg
-outcome         TEXT                 -- NULL | 'WIN' | 'LOSS'
-resolved_at     TEXT
-pnl_usdc        REAL
-pnl_pct         REAL
-status          TEXT DEFAULT 'open'  -- open | resolved | expired
+id, proxy_wallet, market_id, timestamp, side, price, size_usd,
+mid_at_trade, mid_5m_after, mid_30m_after, mid_2h_after
 ```
 
-#### NegRisk config columns (in `config` table)
-```sql
-nr_enabled              INTEGER DEFAULT 1      -- 1=active 0=disabled
-nr_min_gap              REAL    DEFAULT 0.02   -- Min net gap after fees (2%)
-nr_min_leg_liquidity    REAL    DEFAULT 200.0  -- Min liquidity per outcome leg ($)
-nr_max_legs             INTEGER DEFAULT 20     -- Max legs per event to consider
-nr_fee_rate             REAL    DEFAULT 0.02   -- Estimated protocol fee (2%)
-nr_max_position_usdc    REAL    DEFAULT 50.0   -- Max total USDC per basket
-```
+#### `bot_status`, `scan_log`, `runs`, `trades`
+Unchanged from original schema.
 
 ### DB Migrations
 
-`init_db()` runs `ALTER TABLE ... ADD COLUMN` for new columns after table creation. This lets the DB survive deploys without losing data:
+**All schema changes must be recorded in `migrations.sql`** for OpenClaw deployment. This file is idempotent (uses `CREATE TABLE IF NOT EXISTS` and `INSERT OR IGNORE`).
 
-```python
-migrations = [
-    ("config", "max_capital_deployed_pct", "REAL DEFAULT 0.50"),
-    ("config", "nr_enabled",              "INTEGER DEFAULT 1"),
-    ("config", "nr_min_gap",              "REAL DEFAULT 0.02"),
-    ("config", "nr_min_leg_liquidity",    "REAL DEFAULT 200.0"),
-    ("config", "nr_max_legs",             "INTEGER DEFAULT 20"),
-    ("config", "nr_fee_rate",             "REAL DEFAULT 0.02"),
-    ("config", "nr_max_position_usdc",    "REAL DEFAULT 50.0"),
-]
-for table, column, definition in migrations:
-    try:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-    except sqlite3.OperationalError:
-        pass  # column already exists
-```
+`init_db()` in `agent.py` also runs `ALTER TABLE ... ADD COLUMN` migrations for new columns on existing tables.
 
-**Rule:** every new DB column must be added here too.
+**Rule:** Every new table or column must appear in both `agent.py init_db()` AND `migrations.sql`.
 
 ---
 
 ## Backend: agent.py
 
-### Key Constants
-```python
-GAMMA_API    = "https://gamma-api.polymarket.com/markets"
-CLOB_PRICES  = "https://clob.polymarket.com/prices-history"
-SLEEP_BETWEEN_REQUESTS = 0.1  # rate limiting
-```
-
-### Core Functions
-
-#### `passes_basic_filters(m, min_liquidity, require_resolved=True)`
-- Checks: binary market (2 outcomes), volume ≥ 1000, liquidity ≥ min_liquidity, has CLOB token IDs
-- `require_resolved=True` (backtest): `outcomePrices` must be `[1.0, 0.0]` or `[0.0, 1.0]`
-- `require_resolved=False` (paper): accepts any valid price (e.g. `["0.87", "0.13"]`)
-- Returns: `(ok: bool, token_id_yes: str, outcome_winner: str|None)`
-
-> **Critical bug fixed**: paper trading was using `require_resolved=True`, rejecting ALL open markets
-> as "disputed_resolution". Now paper passes `require_resolved=False`.
-
-#### `compute_wash_score(m)` → `(is_wash: bool, reason: str)`
-Detects suspicious volume patterns:
-- `vol_24h / vol_total > 0.85` (and market > 24h old)
-- `vol_24h > 1000` AND few traders
-- `vol_24h > liquidity * 50`
-
-#### `kelly_size(capital, entry_price, ask_price, kelly_fraction, max_pct)`
-```python
-b = (1.0 - ask_price) / ask_price   # odds ratio
-kelly_f = max(0, (b * p - q) / b)   # raw Kelly
-position = capital * kelly_fraction * kelly_f
-position = min(position, capital * max_pct)
-position = max(position, 5.0)        # minimum $5
-```
-
-#### `estimate_spread(liquidity)` → spread fraction
-- liq > 5000 → 0.5% · liq > 1000 → 1.0% · else → 2.0%
-
-#### `resolve_pending_signals(conn)` → int (count resolved)
-For each `open` signal past `closes_at`, queries Gamma API for final outcome, calculates PnL, updates status.
-
-### Paper Trading Flow (`run_paper`)
-
-```
-1. resolve_pending_signals()           — close expired positions
-2. Query open capital:
-   committed = SUM(position_usdc) WHERE status='open'
-   available = (capital * max_capital_deployed_pct) - committed
-   → if available < $5, skip scan entirely
-3. fetch_open_markets(min_liquidity)
-4. For each market:
-   a. passes_basic_filters(..., require_resolved=False)
-   b. compute_wash_score()
-   c. Check closes_at within max_hours
-   d. fetch_price_series() — last 10 min CLOB prices
-   e. current_price in [min_prob, max_prob]?
-   f. Signal exists for token_id? → skip
-   g. available_capital < $5? → break
-   h. estimate_spread() → ask_price
-   i. net_profit_pct >= min_profit_net?
-   j. kelly_size(available_capital, ...)  → deduct from available
-   k. INSERT INTO signals
-5. UPDATE scan_log (all counters + duration)
-6. UPDATE bot_status (last_scan_at, scan_count)
-```
-
 ### CLI Arguments
 ```
 --mode {backtest|paper}   (default: backtest)
+--strategy SLUG           (default: bond_hunter)
 --force                   bypass bot enabled check
---capital FLOAT
---days INT
---min-prob FLOAT
---max-prob FLOAT
---min-profit FLOAT
---max-hours FLOAT
---min-liq FLOAT
---fee-rate FLOAT
+--capital, --days, --min-prob, --max-prob, --min-profit, --max-hours, --min-liq, --fee-rate
 ```
+
+### Strategy Dispatch
+```python
+strategy = get_strategy(args.strategy)
+strategy.run(conn, config)
+```
+
+### Bond Hunter Core Functions (in `strategies/bond_hunter.py`)
+- `passes_basic_filters()`, `compute_wash_score()`, `kelly_size()`, `estimate_spread()`
+- `fetch_price_series()`, `fetch_open_markets()`
+- `resolve_pending_signals()`, `run_paper()`
 
 ---
 
@@ -302,28 +216,100 @@ FastAPI on port 8765. CORS: `allow_origins=["*"]`.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | DB path + timestamp |
-| GET | `/config` | Current strategy config |
-| POST | `/config` | Update config fields (partial update) |
+| GET | `/config` | Bond Hunter config (legacy) |
+| POST | `/config` | Update Bond Hunter config |
 | GET | `/bot` | Bot status + pid_alive |
 | POST | `/bot/enable` | Enable bot |
 | POST | `/bot/disable` | Disable bot |
-| POST | `/bot/scan-now` | Trigger immediate scan (subprocess) |
-| GET | `/signals` | All signals (params: status, limit, offset) |
-| GET | `/signals/open` | Open signals only |
-| GET | `/signals/resolved` | Resolved signals only |
+| POST | `/bot/scan-now` | Trigger Bond Hunter scan |
+| GET | `/signals` | Bond Hunter signals |
+| GET | `/signals/open` | Open signals |
 | GET | `/signals/{id}` | Single signal |
-| GET | `/stats` | Aggregated PnL, win rate, chart series |
-| GET | `/scan-logs` | Scan execution history (param: limit) |
-| GET | `/runs` | Backtest run list |
-| GET | `/runs/{id}` | Single run |
-| GET | `/runs/{id}/trades` | Trades for a run |
-| GET | `/negrisk/signals` | All NegRisk baskets (params: status, limit, offset) |
-| GET | `/negrisk/signals/open` | Open NegRisk baskets only |
-| GET | `/negrisk/signals/{id}` | Single NegRisk basket detail |
-| GET | `/negrisk/stats` | NegRisk aggregated stats (win rate, PnL, avg gap) |
+| GET | `/stats` | Aggregated stats |
+| GET | `/scan-logs` | Scan history |
+| **GET** | **`/strategies`** | **List all strategies** |
+| **GET** | **`/strategies/{slug}`** | **Strategy detail + stats** |
+| **POST** | **`/strategies/{slug}/config`** | **Update strategy config** |
+| **POST** | **`/strategies/{slug}/enable`** | **Enable strategy** |
+| **POST** | **`/strategies/{slug}/disable`** | **Disable strategy** |
+| **POST** | **`/strategies/{slug}/scan-now`** | **Trigger scan** |
+| **GET** | **`/strategies/{slug}/signals`** | **Strategy signals** |
+| **GET** | **`/strategies/{slug}/signals/open`** | **Open signals** |
+| **GET** | **`/strategies/{slug}/stats`** | **Strategy stats** |
+| GET | `/runs`, `/runs/{id}`, `/runs/{id}/trades` | Backtest data |
 
-### `pid_alive` detection
-Uses `ps -o stat= -p {pid}` and checks for `Z` (zombie). `os.kill(pid, 0)` alone was insufficient — zombie processes don't raise an error but are dead.
+---
+
+## IFNL-Lite Strategy
+
+### Architecture
+
+```
+                 ┌──────────────┐
+                 │ Market       │  Every 5 min: select top N markets
+                 │ Selector     │  by volume * liquidity
+                 └──────┬───────┘
+                        │ token_ids
+            ┌───────────┼───────────┐
+            ▼                       ▼
+    ┌───────────────┐      ┌──────────────┐
+    │ WsClient      │      │ DataApiClient │  REST poll every ~15s
+    │ (WebSocket)   │      │ (trades +     │  for proxyWallet
+    │ book, trades  │      │  wallet IDs)  │
+    └───────┬───────┘      └──────┬────────┘
+            │                      │
+            ▼                      ▼
+    ┌───────────────┐      ┌──────────────┐
+    │ Microstructure│      │ Wallet lookup │  DB: ifnl_wallet_profiles
+    │ Engine        │      │ (informed_    │
+    │ (imbalance,   │      │  score)       │
+    │  absorption)  │      └──────┬────────┘
+    └───────┬───────┘             │
+            │                     │
+            └──────────┬──────────┘
+                       ▼
+              ┌────────────────┐
+              │ Signal Engine  │  IFS + divergence detection
+              │ (check every   │
+              │  5 seconds)    │
+              └────────┬───────┘
+                       ▼
+              ┌────────────────┐
+              │ Execution      │  Paper fills, TP/SL/time exits
+              │ Manager        │  (check every 3 seconds)
+              └────────────────┘
+```
+
+### Signal Generation Logic
+
+1. DataApiClient polls `/trades` with `proxyWallet` every ~15s
+2. Each wallet is looked up in `ifnl_wallet_profiles` DB
+3. Compute IFS (Informed Flow Score) per direction:
+   ```
+   IFS = sum(trade_size_usd * informed_score * reliability) over window
+   ```
+4. Expected move = K1 * normalized_IFS_30s + K2 * normalized_IFS_2m
+5. Divergence = expected_move - actual_move (from WebSocket mid drift)
+6. Signal if: divergence > 18 bps AND book_imbalance confirms AND absorption high AND >= 2 informed wallets
+
+### Exit Rules
+- **Take profit:** mid moved >= 80% of expected move
+- **Hard stop:** mid moved against > 22 bps
+- **Time stop:** > 20 min, or < 6 bps progress after 5 min
+- **Invalidation:** book imbalance flips 2x, or no informed trades for 90s
+- **Cooldown:** 10 min per market after stop/invalidation
+
+### Wallet Profiler (offline, runs daily)
+```bash
+python3 -m strategies.ifnl_lite.wallet_profiler --db data/polyagent.db
+```
+Computes markout P&L at 5m/30m/2h, produces `informed_score` per wallet.
+
+### IFNL Runner
+```bash
+python3 -m strategies.ifnl_lite.ifnl_runner --db data/polyagent.db
+```
+Starts continuous process: WsClient + DataApiClient + signal/exit loops.
 
 ---
 
@@ -341,13 +327,6 @@ rewrites() {
 }
 ```
 
-```typescript
-// lib/api.ts
-const BASE = '/api'   // relative — works on any device/IP
-```
-
-**Why this matters:** `NEXT_PUBLIC_API_URL=http://localhost:8765` compiled into JS means mobile browsers call their own localhost (the phone), not the server. The proxy runs server-side, so mobile/Safari never touch port 8765 directly.
-
 ### Pages
 
 | Route | Component | Description |
@@ -355,37 +334,33 @@ const BASE = '/api'   // relative — works on any device/IP
 | `/` | page.tsx | Redirect to `/login` |
 | `/login` | login/page.tsx | Hardcoded: `admin@polyagent.io` / `admin` |
 | `/dashboard` | dashboard/page.tsx | KPIs, PnL chart, signals, bot control |
-| `/strategies` | strategies/page.tsx | Bond Hunter config card |
+| `/strategies` | strategies/page.tsx | Bond Hunter + IFNL-Lite config cards |
 | `/logs` | logs/page.tsx | Scan execution history |
 
 ### Key Components
 
-- **`BotControl`** — Start/stop bot, Scan Now button. `disabled={actionLoading}` only (not `scanning` — was a bug)
-- **`KpiGrid`** / **`KpiCard`** — 4 KPI cards (Capital, PnL, Win Rate, Active Signals)
-- **`PnlChart`** — Recharts area chart, cumulative PnL
-- **`BondHunterCard`** — Editable strategy params grid, Save button
-- **`AppShell`** — Layout wrapper: auth check, sidebar, topbar
-- **`Sidebar`** — Nav: Dashboard, Strategies, Logs
-- **`TickerTape`** — Quick stats banner
+- **`BondHunterCard`** — Bond Hunter config with editable params, save button
+- **`IfnlLiteCard`** — IFNL-Lite config (5 sections: market selection, signal thresholds, position sizing, exit rules, IFS params), start/stop toggle, wallet stats
+- **`BotControl`** — Start/stop bot, Scan Now button
+- **`KpiGrid`** / **`PnlChart`** / **`ActiveSignals`** / **`RecentSignalsTable`**
+- **`AppShell`** / **`Sidebar`** / **`TickerTape`**
 
 ### Hooks (all SWR-based)
 
 ```typescript
-useStats()          // 30s refresh → /stats
-useSignals(params)  // 30s refresh → /signals
-useOpenSignals()    // 30s refresh → /signals/open
-useBot()            // 5s refresh  → /bot
-useConfig()         // → /config + saveConfig()
-useAuth()           // localStorage auth check
+useStats()           // 30s refresh → /stats
+useSignals(params)   // 30s refresh → /signals
+useOpenSignals()     // 30s refresh → /signals/open
+useBot()             // 5s refresh  → /bot
+useConfig()          // → /config + saveConfig()
+useStrategies()      // 30s refresh → /strategies
+useStrategy(slug)    // 30s refresh → /strategies/{slug}
+useAuth()            // localStorage auth check
 ```
 
-### Auth
-Hardcoded in `lib/auth.ts`: `admin@polyagent.io` / `admin`. State stored in localStorage under `polyagent_auth`. No backend auth — API is open.
-
 ### Typography
-- `var(--mono)` → DM Mono (data, labels, numbers, technical text)
+- `var(--mono)` → DM Mono (data, labels, numbers)
 - `var(--sans)` → Syne (headings, buttons)
-- Logs page: all `var(--mono)` (Syne bold was too aggressive for dense data)
 
 ---
 
@@ -395,22 +370,16 @@ Hardcoded in `lib/auth.ts`: `admin@polyagent.io` / `admin`. State stored in loca
 1. Install Python deps (`pip install -r requirements.txt`)
 2. Init DB: `python3 agent.py --mode paper --force`
 3. Start API: `uvicorn api:app --host 0.0.0.0 --port 8765` (background)
-4. Detect server IP (for display only, not for API config)
-5. `npm install && npm run build && npm start --port 3000` (background)
-6. Add cron: `*/15 * * * * python3 agent.py --mode paper`
+4. `npm install && npm run build && npm start --port 3000` (background)
+5. Add cron: `*/15 * * * * python3 agent.py --mode paper`
 
 ### Environment variables
 
 ```bash
-POLYAGENT_DB=/app/data/polyagent.db    # DB path — set by OpenClaw Docker
-POLYAGENT_DATA_DIR=/data               # Data dir — start.sh uses this to set POLYAGENT_DB
-API_URL=http://localhost:8765          # Backend URL for Next.js proxy (optional)
+POLYAGENT_DB=/app/data/polyagent.db    # DB path
+POLYAGENT_DATA_DIR=/data               # Data dir
+API_URL=http://localhost:8765          # Backend URL for Next.js proxy
 ```
-
-### OpenClaw Docker notes
-- `./data:/app/data` volume → DB survives rebuilds
-- `POLYAGENT_DB` not set → agent.py + api.py default to `/app/data/polyagent.db`
-- `start.sh` is the entrypoint — runs all services + cron
 
 ---
 
@@ -420,53 +389,64 @@ API_URL=http://localhost:8765          # Backend URL for Next.js proxy (optional
 |-----|-----------|-----|
 | Scan Now disabled after first click | `pid_alive` returned true for zombie process | Detect zombie via `ps -o stat=` checking for `Z` |
 | No data on mobile / Safari | `NEXT_PUBLIC_API_URL=localhost` compiled into JS bundle | Next.js proxy: all calls via `/api/*` rewrite |
-| Paper trading finds 0 signals | `passes_basic_filters` required `outcomePrices=[1,0]` — valid only for resolved markets | Added `require_resolved=False` for paper mode |
-| Settings → wrong page | `href: '/dashboard'` hardcoded | Fixed to `/strategies` |
+| Paper trading finds 0 signals | `passes_basic_filters` required `outcomePrices=[1,0]` | Added `require_resolved=False` for paper mode |
 | `frontend/src/app/logs/` gitignored | `.gitignore` had `logs/` (matches any subdir) | Changed to `/logs/` (root only) |
-| DB reset on Docker rebuild | DB stored in `/app/` (container layer) | Moved to `/app/data/` (mounted volume) |
-| Signals stay open forever after close | `resolve_pending_signals` queried Gamma API with `clobTokenIds` filter — that filter is silently ignored by the API (returns random 20 markets, never the target) | Switched to `CLOB last-trade-price` endpoint: queries by token_id directly, price ≥ 0.9 = YES win, ≤ 0.1 = NO loss, mid-range = not settled yet (expire after 6h) |
+| DB reset on Docker rebuild | DB stored in container layer | Moved to `/app/data/` (mounted volume) |
+| Signals stay open forever | Gamma API ignores `clobTokenIds` filter | Use CLOB last-trade-price endpoint directly |
 
 ---
 
-## Adding a New Config Parameter
+## Adding a New Strategy
 
-1. **`agent.py`** — Add column to `CREATE TABLE config` schema + add migration in `init_db()`:
-   ```python
-   migrations = [
-       ...,
-       ("config", "new_param", "REAL DEFAULT 0.5"),
-   ]
-   ```
-2. **`agent.py`** — Read it in `load_config_from_db()`:
-   ```python
-   "new_param": cfg.get("new_param", 0.5),
-   ```
-3. **`api.py`** — Add to `ConfigUpdate` model:
-   ```python
-   new_param: Optional[float] = None
-   ```
-4. **`frontend/src/types/index.ts`** — Add to `BotConfig` interface
-5. **`frontend/src/components/strategies/BondHunterCard.tsx`** — Add to `PARAM_META` array (Bond Hunter params)
-   **OR** `frontend/src/components/strategies/NegRiskHunterCard.tsx` — Add to `PARAM_META` (NegRisk params, prefix `nr_`)
+1. Create `strategies/<slug>/` or `strategies/<slug>.py`
+2. Implement `BaseStrategy` with all abstract methods
+3. Register in `strategies/__init__.py` `STRATEGY_REGISTRY`
+4. Add DB tables in `agent.py init_db()` AND `migrations.sql`
+5. Seed strategy row: `INSERT OR IGNORE INTO strategies (...)`
+6. Add frontend card component in `components/strategies/`
+7. Import card in `strategies/page.tsx`
+
+## Adding a New Config Parameter (Bond Hunter)
+
+1. **`agent.py`** — Add column to `CREATE TABLE config` + migration
+2. **`agent.py`** — Read in `load_config_from_db()`
+3. **`api.py`** — Add to `ConfigUpdate` model
+4. **`frontend/src/types/index.ts`** — Add to `BotConfig`
+5. **`frontend/src/components/strategies/BondHunterCard.tsx`** — Add to `PARAM_META`
+
+## Adding a New Config Parameter (IFNL-Lite)
+
+1. **`strategies/ifnl_lite/__init__.py`** — Add to `default_config()` dict
+2. **`frontend/src/components/strategies/IfnlLiteCard.tsx`** — Add to `PARAM_META`
+3. Config is stored as JSON — no DB schema change needed
 
 ---
 
 ## Useful Commands
 
 ```bash
-# Run a manual paper scan (local)
+# Run a manual paper scan (Bond Hunter)
 export POLYAGENT_DB=./data/polyagent.db
 python3 agent.py --mode paper --force
+
+# Run a manual scan for a specific strategy
+python3 agent.py --mode paper --force --strategy bond_hunter
 
 # Run backtest
 python3 agent.py --mode backtest --days 60 --capital 500
 
+# Start IFNL-Lite continuous runner
+python3 -m strategies.ifnl_lite.ifnl_runner --db data/polyagent.db
+
+# Run wallet profiler
+python3 -m strategies.ifnl_lite.wallet_profiler --db data/polyagent.db
+
 # Check API
-curl http://localhost:8765/stats | python3 -m json.tool
+curl http://localhost:8765/strategies | python3 -m json.tool
 
 # Check logs
 tail -f logs/agent.log
-tail -f logs/api.log
+tail -f logs/ifnl_lite.log
 
 # Restart everything
 bash stop.sh && bash start.sh

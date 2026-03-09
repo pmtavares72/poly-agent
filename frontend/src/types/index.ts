@@ -108,6 +108,48 @@ export interface ScanLogsResponse {
   data: ScanLog[]
 }
 
+export interface Strategy {
+  slug: string
+  name: string
+  type: 'cron' | 'continuous'
+  enabled: boolean
+  capital: number
+  config_json: string
+  config: Record<string, unknown>
+  created_at: string | null
+  updated_at: string | null
+  stats?: Record<string, unknown>
+}
+
+export interface StrategiesResponse {
+  strategies: Strategy[]
+}
+
+export interface IfnlSignal {
+  id: number
+  detected_at: string
+  token_id: string
+  question: string | null
+  market_url: string | null
+  direction: 'YES' | 'NO'
+  signal_strength: number
+  entry_mid: number
+  entry_price: number
+  exit_price: number | null
+  position_usdc: number
+  informed_flow: number
+  divergence: number
+  book_imbalance: number
+  tp_target: number
+  sl_target: number
+  time_limit_min: number
+  resolved_at: string | null
+  pnl_usdc: number | null
+  pnl_pct: number | null
+  exit_reason: string | null
+  status: 'open' | 'resolved' | 'expired'
+}
+
 export interface Run {
   id: number
   started_at: string

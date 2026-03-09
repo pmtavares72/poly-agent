@@ -199,6 +199,72 @@ def init_db(db_path: str = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.d
             status              TEXT DEFAULT 'open'  -- open | resolved | expired
         );
 
+        -- Strategy registry (multi-strategy architecture)
+        CREATE TABLE IF NOT EXISTS strategies (
+            slug        TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            type        TEXT NOT NULL DEFAULT 'cron',
+            enabled     INTEGER DEFAULT 0,
+            capital     REAL DEFAULT 0,
+            config_json TEXT DEFAULT '{}',
+            created_at  TEXT,
+            updated_at  TEXT
+        );
+
+        -- IFNL-Lite tables
+        CREATE TABLE IF NOT EXISTS ifnl_wallet_profiles (
+            proxy_wallet    TEXT PRIMARY KEY,
+            total_trades    INTEGER DEFAULT 0,
+            n_markets       INTEGER DEFAULT 0,
+            avg_trade_size  REAL DEFAULT 0,
+            pnl_markout_5m  REAL DEFAULT 0,
+            pnl_markout_30m REAL DEFAULT 0,
+            pnl_markout_2h  REAL DEFAULT 0,
+            informed_score  REAL DEFAULT 0.5,
+            noise_score     REAL DEFAULT 0.5,
+            reliability     REAL DEFAULT 0.5,
+            last_updated    TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS ifnl_wallet_trades (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            proxy_wallet    TEXT NOT NULL,
+            market_id       TEXT NOT NULL,
+            timestamp       TEXT NOT NULL,
+            side            TEXT,
+            price           REAL,
+            size_usd        REAL,
+            mid_at_trade    REAL,
+            mid_5m_after    REAL,
+            mid_30m_after   REAL,
+            mid_2h_after    REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS ifnl_signals (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            detected_at     TEXT NOT NULL,
+            token_id        TEXT NOT NULL,
+            question        TEXT,
+            market_url      TEXT,
+            direction       TEXT,
+            signal_strength REAL,
+            entry_mid       REAL,
+            entry_price     REAL,
+            exit_price      REAL,
+            position_usdc   REAL,
+            informed_flow   REAL,
+            divergence      REAL,
+            book_imbalance  REAL,
+            tp_target       REAL,
+            sl_target       REAL,
+            time_limit_min  INTEGER,
+            resolved_at     TEXT,
+            pnl_usdc        REAL,
+            pnl_pct         REAL,
+            exit_reason     TEXT,
+            status          TEXT DEFAULT 'open'
+        );
+
     """)
     conn.commit()
 
@@ -212,6 +278,23 @@ def init_db(db_path: str = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.d
             conn.commit()
         except sqlite3.OperationalError:
             pass  # columna ya existe
+
+    # Seed default strategies
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn.execute("""
+        INSERT OR IGNORE INTO strategies (slug, name, type, enabled, capital, config_json, created_at)
+        VALUES ('bond_hunter', 'Bond Hunter', 'cron', 1, 500.0, '{}', ?)
+    """, (now_iso,))
+    conn.execute("""
+        INSERT OR IGNORE INTO strategies (slug, name, type, enabled, capital, config_json, created_at)
+        VALUES ('ifnl_lite', 'IFNL-Lite', 'continuous', 0, 500.0, '{}', ?)
+    """, (now_iso,))
+    conn.commit()
+
+    # Initialize strategy-specific tables
+    from strategies import all_strategies
+    for strategy in all_strategies().values():
+        strategy.init_tables(conn)
 
     return conn
 
@@ -1290,10 +1373,12 @@ def parse_args() -> dict:
     parser.add_argument("--min-liq",   type=float, default=MIN_LIQUIDITY_USDC, help="Liquidez mínima USDC")
     parser.add_argument("--fee-rate",  type=float, default=FEE_RATE,           help="Fee protocolo")
     parser.add_argument("--force",     action="store_true",                    help="Forzar ejecución aunque bot esté disabled")
+    parser.add_argument("--strategy",  type=str,   default="bond_hunter",      help="Strategy slug (bond_hunter | ifnl_lite)")
     args = parser.parse_args()
 
     return {
         "mode":             args.mode,
+        "strategy":         args.strategy,
         "days_back":        args.days,
         "initial_capital":  args.capital,
         "min_prob":         args.min_prob,
@@ -1348,12 +1433,15 @@ def check_bot_enabled(conn: sqlite3.Connection) -> bool:
 
 if __name__ == "__main__":
     import os
+    from strategies import get_strategy
 
     cli_params = parse_args()
     mode = cli_params.get("mode", "backtest")
+    strategy_slug = cli_params.get("strategy", "bond_hunter")
 
     # Inicializar BD primero para tener acceso a config y bot_status
     conn_init = init_db()
+    conn_init.row_factory = sqlite3.Row
 
     if mode == "paper":
         # Verificar si el bot está habilitado (a menos que se fuerce con --force)
@@ -1375,25 +1463,27 @@ if __name__ == "__main__":
             last_scan_at=now_iso,
             last_error=None,
         )
-        conn_init.close()
 
-        console.rule("[bold green]POLYMARKET BOND HUNTER — PAPER TRADING[/bold green]")
-        console.print(f"  Capital referencia: [bold]${params['initial_capital']:.2f}[/bold]  |  "
-                      f"Prob. entrada: [bold]{params['min_prob']}-{params['max_prob']}[/bold]  |  "
-                      f"Max cierre: [bold]{params['max_hours']}h[/bold]\n")
+        # Get strategy instance
+        strategy = get_strategy(strategy_slug)
+        if not strategy:
+            console.print(f"[red]Unknown strategy: {strategy_slug}[/red]")
+            conn_init.close()
+            exit(1)
+
+        console.rule(f"[bold green]POLYMARKET {strategy.name.upper()} — PAPER TRADING[/bold green]")
+        console.print(f"  Capital: [bold]${params['initial_capital']:.2f}[/bold]  |  "
+                      f"Strategy: [bold]{strategy.name}[/bold]\n")
 
         try:
-            run_paper(params)
+            strategy.run(conn_init, params)
             # Incrementar contador de scans
-            conn_done = init_db()
-            cur = conn_done.cursor()
-            cur.execute("UPDATE bot_status SET scan_count = scan_count + 1 WHERE id=1")
-            conn_done.commit()
-            conn_done.close()
+            conn_init.execute("UPDATE bot_status SET scan_count = scan_count + 1 WHERE id=1")
+            conn_init.commit()
+            conn_init.close()
         except Exception as e:
-            conn_err = init_db()
-            update_bot_status(conn_err, last_error=str(e))
-            conn_err.close()
+            update_bot_status(conn_init, last_error=str(e))
+            conn_init.close()
             raise
 
     else:

@@ -1,0 +1,619 @@
+"""
+Bond Hunter Strategy
+====================
+Buys YES tokens in binary markets at 0.95-0.995, holds until resolution (~48h),
+exits at 1.0 for small but consistent returns.
+"""
+
+import json
+import time
+import sqlite3
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+from rich.console import Console
+
+from strategies.base import BaseStrategy
+
+GAMMA_API = "https://gamma-api.polymarket.com/markets"
+CLOB_PRICES = "https://clob.polymarket.com/prices-history"
+CLOB_LAST_TRADE = "https://clob.polymarket.com/last-trade-price"
+REQUEST_TIMEOUT = 10
+SLEEP_BETWEEN_REQUESTS = 0.1
+
+console = Console()
+
+
+class BondHunterStrategy(BaseStrategy):
+    slug = "bond_hunter"
+    name = "Bond Hunter"
+    strategy_type = "cron"
+
+    def init_tables(self, conn: sqlite3.Connection):
+        """Bond Hunter uses the existing 'signals' table — no new tables needed."""
+        pass
+
+    def default_config(self) -> dict:
+        return {
+            "initial_capital": 500.0,
+            "min_probability": 0.95,
+            "max_probability": 0.995,
+            "min_profit_net": 0.015,
+            "max_hours_to_close": 48.0,
+            "min_liquidity_usdc": 500.0,
+            "kelly_fraction": 0.25,
+            "max_position_pct": 0.15,
+            "max_capital_deployed_pct": 0.50,
+            "fee_rate": 0.005,
+            "scan_interval_min": 15,
+        }
+
+    def run(self, conn: sqlite3.Connection, config: dict):
+        """Execute a paper trading scan."""
+        run_paper(conn, config)
+
+    def resolve_signals(self, conn: sqlite3.Connection) -> int:
+        return resolve_pending_signals(conn)
+
+    def get_signals(self, conn: sqlite3.Connection, status: str = None,
+                    limit: int = 100, offset: int = 0) -> dict:
+        cur = conn.cursor()
+        if status in ("open", "resolved", "expired"):
+            cur.execute(
+                "SELECT * FROM signals WHERE status=? ORDER BY detected_at DESC LIMIT ? OFFSET ?",
+                (status, limit, offset),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM signals ORDER BY detected_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        data = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            "SELECT COUNT(*) FROM signals" + (" WHERE status=?" if status else ""),
+            (status,) if status else (),
+        )
+        total = cur.fetchone()[0]
+        return {"total": total, "limit": limit, "offset": offset, "data": data}
+
+    def get_stats(self, conn: sqlite3.Connection) -> dict:
+        cur = conn.cursor()
+
+        def scalar(sql, params=()):
+            cur.execute(sql, params)
+            v = cur.fetchone()[0]
+            return v or 0
+
+        total = scalar("SELECT COUNT(*) FROM signals")
+        open_c = scalar("SELECT COUNT(*) FROM signals WHERE status='open'")
+        resolved_c = scalar("SELECT COUNT(*) FROM signals WHERE status='resolved'")
+        wins = scalar("SELECT COUNT(*) FROM signals WHERE outcome='YES'")
+        losses = scalar("SELECT COUNT(*) FROM signals WHERE outcome='NO'")
+        total_pnl = scalar("SELECT SUM(pnl_usdc) FROM signals WHERE status='resolved'")
+        avg_spread = scalar("SELECT AVG(spread_entry_pct) FROM signals")
+        best = scalar("SELECT MAX(pnl_usdc) FROM signals WHERE status='resolved'")
+        worst = scalar("SELECT MIN(pnl_usdc) FROM signals WHERE status='resolved'")
+        total_fees = scalar("SELECT SUM(protocol_fee) FROM signals WHERE status='resolved'")
+
+        cur.execute("""
+            SELECT resolved_at, pnl_usdc FROM signals
+            WHERE status='resolved' AND resolved_at IS NOT NULL
+            ORDER BY resolved_at ASC
+        """)
+        pnl_series = []
+        cumulative = 0.0
+        for r in cur.fetchall():
+            cumulative += (r["pnl_usdc"] or 0)
+            pnl_series.append({"ts": r["resolved_at"], "cumulative_pnl": round(cumulative, 4)})
+
+        win_rate = round(wins / resolved_c * 100, 1) if resolved_c > 0 else 0.0
+
+        return {
+            "total_signals": total,
+            "open": open_c,
+            "resolved": resolved_c,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "total_pnl": round(float(total_pnl), 4),
+            "avg_spread_pct": round(float(avg_spread) * 100, 3) if avg_spread else 0,
+            "best_trade": round(float(best), 4),
+            "worst_trade": round(float(worst), 4),
+            "total_fees": round(float(total_fees), 4),
+            "pnl_series": pnl_series,
+        }
+
+
+# ─────────────────────────────────────────────
+# HTTP HELPERS
+# ─────────────────────────────────────────────
+
+def safe_get(url: str, params: dict = None) -> Optional[dict]:
+    """GET with retry on 429."""
+    try:
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 429:
+            time.sleep(2)
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        console.print(f"[yellow]  HTTP error: {exc}[/yellow]")
+        return None
+
+
+# ─────────────────────────────────────────────
+# MARKET FETCHING
+# ─────────────────────────────────────────────
+
+def fetch_open_markets(min_liquidity: float) -> list:
+    """Download currently open markets from Gamma API."""
+    markets = []
+    offset = 0
+    limit = 500
+    while True:
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": limit,
+            "offset": offset,
+            "order": "endDate",
+            "ascending": "true",
+        }
+        data = safe_get(GAMMA_API, params)
+        if not data:
+            break
+        batch = data if isinstance(data, list) else data.get("markets", [])
+        if not batch:
+            break
+        for m in batch:
+            outcomes_raw = m.get("outcomes", [])
+            if isinstance(outcomes_raw, str):
+                try:
+                    outcomes_raw = json.loads(outcomes_raw)
+                except (ValueError, TypeError):
+                    outcomes_raw = []
+            if len(outcomes_raw) != 2:
+                continue
+            if not m.get("clobTokenIds"):
+                continue
+            if float(m.get("volume") or 0) < 1000:
+                continue
+            markets.append(m)
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+        offset += limit
+        if len(batch) < limit:
+            break
+    return markets
+
+
+def fetch_price_series(token_id: str, start_ts: int, end_ts: int) -> list:
+    """Returns list of {'t': unix, 'p': price} or []."""
+    params = {
+        "market": token_id,
+        "startTs": start_ts,
+        "endTs": end_ts,
+        "fidelity": 1,
+    }
+    data = safe_get(CLOB_PRICES, params)
+    if not data:
+        return []
+    history = data.get("history", [])
+    return history if isinstance(history, list) else []
+
+
+# ─────────────────────────────────────────────
+# FILTERS
+# ─────────────────────────────────────────────
+
+def passes_basic_filters(m: dict, min_liquidity: float, require_resolved: bool = True) -> tuple:
+    """
+    Returns (True, token_id_yes, outcome_winner) or (False, reason, None).
+    require_resolved=True: requires outcomePrices=[1,0] or [0,1] (backtest)
+    require_resolved=False: accepts any valid price (paper)
+    """
+    outcomes = m.get("outcomes") or []
+    if isinstance(outcomes, str):
+        try:
+            outcomes = json.loads(outcomes)
+        except (ValueError, TypeError):
+            outcomes = []
+
+    if len(outcomes) != 2:
+        return False, "not_binary", None
+
+    outcome_prices_raw = m.get("outcomePrices") or []
+    if isinstance(outcome_prices_raw, str):
+        try:
+            outcome_prices_raw = json.loads(outcome_prices_raw)
+        except (ValueError, TypeError):
+            outcome_prices_raw = []
+
+    if len(outcome_prices_raw) != 2:
+        return False, "no_outcome_prices", None
+
+    try:
+        op = [float(x) for x in outcome_prices_raw]
+    except (TypeError, ValueError):
+        return False, "bad_outcome_prices", None
+
+    if op == [1.0, 0.0]:
+        outcome_winner = "YES"
+    elif op == [0.0, 1.0]:
+        outcome_winner = "NO"
+    elif require_resolved:
+        return False, "disputed_resolution", None
+    else:
+        outcome_winner = None
+
+    volume = float(m.get("volume", 0) or 0)
+    if volume < 1000:
+        return False, "low_volume", None
+
+    liquidity_raw = m.get("liquidity")
+    if liquidity_raw is not None:
+        liquidity = float(liquidity_raw or 0)
+        if liquidity < min_liquidity:
+            return False, "low_liquidity", None
+    else:
+        spread_raw = float(m.get("spread") or 1.0)
+        if spread_raw > 0.05:
+            return False, "low_liquidity_proxy", None
+
+    clob_ids_raw = m.get("clobTokenIds") or m.get("clob_token_ids") or []
+    if isinstance(clob_ids_raw, str):
+        try:
+            clob_ids_raw = json.loads(clob_ids_raw)
+        except (ValueError, TypeError):
+            clob_ids_raw = []
+
+    if not clob_ids_raw:
+        return False, "no_clob_ids", None
+
+    token_id_yes = clob_ids_raw[0]
+    return True, token_id_yes, outcome_winner
+
+
+def compute_wash_score(m: dict) -> tuple:
+    """Returns (is_wash: bool, reason: str)"""
+    volume_total = float(m.get("volume", 0) or 0)
+    volume_24h = float(m.get("volume24hr", 0) or m.get("volume_24h", 0) or 0)
+    liquidity = float(m.get("liquidity") or 0)
+    traders = int(m.get("uniqueTraderCount", 0) or m.get("unique_traders_count", 0) or 999)
+
+    duration_h = None
+    start_str = m.get("startDate") or m.get("startDateIso")
+    closed_str = m.get("closedTime") or m.get("endDate") or m.get("endDateIso")
+    if start_str and closed_str:
+        try:
+            start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+            close_dt = datetime.fromisoformat(closed_str.replace("Z", "+00:00"))
+            duration_h = (close_dt - start_dt).total_seconds() / 3600
+        except ValueError:
+            pass
+
+    if duration_h is None or duration_h > 24:
+        if volume_total > 0 and (volume_24h / volume_total) > 0.85:
+            return True, "vol24h/total>0.85"
+
+    if volume_24h > 1000 and traders < 5:
+        return True, "few_traders_high_vol"
+    if liquidity > 0 and volume_24h > liquidity * 50:
+        return True, "vol/liq_anomaly"
+    return False, "ok"
+
+
+# ─────────────────────────────────────────────
+# SPREAD & SIZING
+# ─────────────────────────────────────────────
+
+def estimate_spread(liquidity: float) -> float:
+    """Returns estimated spread as fraction (e.g. 0.005 = 0.5%)."""
+    if liquidity > 5000:
+        return 0.005
+    if liquidity > 1000:
+        return 0.010
+    return 0.020
+
+
+def kelly_size(capital: float, entry_price: float, ask_price: float,
+               kelly_fraction: float, max_pct: float) -> float:
+    b = (1.0 - ask_price) / ask_price
+    p = entry_price
+    q = 1.0 - p
+    kelly_f = max(0.0, (b * p - q) / b)
+    position = capital * kelly_fraction * kelly_f
+    position = min(position, capital * max_pct)
+    position = max(position, 5.0)
+    return position
+
+
+# ─────────────────────────────────────────────
+# SIGNAL RESOLUTION
+# ─────────────────────────────────────────────
+
+def resolve_pending_signals(conn: sqlite3.Connection) -> int:
+    """
+    For each 'open' signal past closes_at, queries CLOB last-trade-price
+    to determine outcome:
+      - price >= 0.9 → resolved YES (win)
+      - price <= 0.1 → resolved NO (loss)
+      - mid-range → not settled yet; expire after 6h
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT id, token_id, question, closes_at, position_usdc, shares, protocol_fee FROM signals WHERE status='open'")
+    pending = cur.fetchall()
+    if not pending:
+        return 0
+    resolved_count = 0
+
+    now = datetime.now(timezone.utc)
+    console.print(f"\n[cyan]Checking {len(pending)} pending signals for resolution...[/cyan]")
+
+    for row in pending:
+        sig_id = row["id"]
+        token_id = row["token_id"]
+        question = row["question"]
+        closes_at_str = row["closes_at"]
+        position_usdc = row["position_usdc"]
+        shares = row["shares"]
+        protocol_fee = row["protocol_fee"]
+
+        try:
+            closes_dt = datetime.fromisoformat(closes_at_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+
+        if closes_dt > now:
+            continue
+
+        hours_past = (now - closes_dt).total_seconds() / 3600
+
+        data = safe_get(CLOB_LAST_TRADE, {"token_id": token_id})
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+        if not data:
+            if hours_past > 6:
+                cur.execute("UPDATE signals SET status='expired' WHERE id=?", (sig_id,))
+                conn.commit()
+            continue
+
+        try:
+            last_price = float(data.get("price", 0))
+        except (TypeError, ValueError):
+            continue
+
+        if last_price >= 0.9:
+            outcome = "YES"
+            revenue = (shares or 0) * 1.0
+            pnl = revenue - (position_usdc or 0) - (protocol_fee or 0)
+        elif last_price <= 0.1:
+            outcome = "NO"
+            revenue = 0.0
+            pnl = -((position_usdc or 0) + (protocol_fee or 0))
+        else:
+            if hours_past > 6:
+                cur.execute("UPDATE signals SET status='expired' WHERE id=?", (sig_id,))
+                conn.commit()
+            continue
+
+        pnl_pct = (pnl / position_usdc * 100) if position_usdc else 0
+        icon = "✅" if outcome == "YES" else "❌"
+        q_short = (question[:50] + "…") if question and len(question) > 50 else question
+        color = "green" if pnl >= 0 else "red"
+        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        console.print(f"  {icon}  [bold]{q_short}[/bold]  [{color}]{pnl_str}[/{color}]  (resolved)")
+
+        cur.execute("""
+            UPDATE signals SET outcome=?, resolved_at=?, pnl_usdc=?, pnl_pct=?, status='resolved'
+            WHERE id=?
+        """, (outcome, now.isoformat(), pnl, pnl_pct, sig_id))
+        conn.commit()
+        resolved_count += 1
+
+    return resolved_count
+
+
+# ─────────────────────────────────────────────
+# PAPER TRADING SCAN
+# ─────────────────────────────────────────────
+
+def run_paper(conn: sqlite3.Connection, config: dict):
+    """
+    Paper trading mode: scan open markets, detect Bond Hunter signals,
+    record in signals table without executing real orders.
+    """
+    min_prob = config.get("min_probability", config.get("min_prob", 0.95))
+    max_prob = config.get("max_probability", config.get("max_prob", 0.995))
+    min_profit_net = config.get("min_profit_net", 0.015)
+    max_hours = config.get("max_hours_to_close", config.get("max_hours", 48.0))
+    min_liquidity = config.get("min_liquidity_usdc", config.get("min_liquidity", 500.0))
+    fee_rate = config.get("fee_rate", 0.005)
+    capital = config.get("initial_capital", 500.0)
+    kelly_fraction = config.get("kelly_fraction", 0.25)
+    max_position_pct = config.get("max_position_pct", 0.15)
+    max_capital_deployed_pct = config.get("max_capital_deployed_pct", 0.50)
+
+    import time as _time
+    scan_start = _time.time()
+
+    # Insert scan_log entry
+    scan_started_at = datetime.now(timezone.utc).isoformat()
+    cur_log = conn.cursor()
+    cur_log.execute(
+        "INSERT INTO scan_log (started_at, mode) VALUES (?, 'paper')",
+        (scan_started_at,)
+    )
+    conn.commit()
+    scan_log_id = cur_log.lastrowid
+
+    # Resolve pending signals first
+    resolved_count = resolve_pending_signals(conn)
+
+    # Check available capital
+    cur_cap = conn.cursor()
+    cur_cap.execute("SELECT COALESCE(SUM(position_usdc),0), COUNT(*) FROM signals WHERE status='open'")
+    committed_usdc, open_count = cur_cap.fetchone()
+    max_deployable = capital * max_capital_deployed_pct
+    available_capital = max(0.0, max_deployable - committed_usdc)
+    deployed_pct = (committed_usdc / capital * 100) if capital > 0 else 0
+
+    if committed_usdc >= max_deployable:
+        console.print(
+            f"\n[yellow]⚠ Capital deployed ${committed_usdc:.2f} "
+            f"({deployed_pct:.0f}%) ≥ limit {max_capital_deployed_pct*100:.0f}% "
+            f"of capital. No new positions.[/yellow]\n"
+        )
+        markets = []
+    else:
+        console.print(f"\n[cyan]Scanning open markets for Bond Hunter signals...[/cyan]\n")
+        console.print(
+            f"[cyan]  Capital: ${capital:.2f} · Deployed: ${committed_usdc:.2f} "
+            f"({deployed_pct:.0f}%) · Available: ${available_capital:.2f} "
+            f"(limit {max_capital_deployed_pct*100:.0f}%)[/cyan]\n"
+        )
+        markets = fetch_open_markets(min_liquidity)
+        console.print(f"[cyan]  {len(markets)} active markets found[/cyan]\n")
+
+    new_signals = 0
+    markets_checked = 0
+    skipped_wash = 0
+    skipped_spread = 0
+    skipped_no_data = 0
+    skipped_price = 0
+
+    for m in markets:
+        question = m.get("question", m.get("title", "Unknown"))
+
+        ok, token_or_reason, _ = passes_basic_filters(m, min_liquidity, require_resolved=False)
+        if not ok:
+            continue
+
+        token_id_yes = token_or_reason
+        markets_checked += 1
+
+        is_wash, _ = compute_wash_score(m)
+        if is_wash:
+            skipped_wash += 1
+            continue
+
+        end_date_str = m.get("endDate") or m.get("endDateIso") or ""
+        try:
+            end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+            end_ts = int(end_dt.timestamp())
+        except ValueError:
+            continue
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        hours_to_close = (end_ts - now_ts) / 3600.0
+        if hours_to_close <= 0 or hours_to_close > max_hours:
+            continue
+
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+        start_ts = now_ts - 600
+        history = fetch_price_series(token_id_yes, start_ts, now_ts)
+        if not history:
+            skipped_no_data += 1
+            continue
+
+        try:
+            current_price = float(history[-1]["p"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if not (min_prob <= current_price <= max_prob):
+            skipped_price += 1
+            continue
+
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM signals WHERE token_id=? AND status='open'", (token_id_yes,))
+        if cur.fetchone():
+            continue
+
+        if available_capital < 5.0:
+            break
+
+        liquidity_raw = m.get("liquidity")
+        liquidity = float(liquidity_raw or 0) if liquidity_raw is not None else None
+        if liquidity is None:
+            market_spread = float(m.get("spread") or 0.02)
+            liquidity = 10000.0 if market_spread < 0.005 else (2000.0 if market_spread < 0.01 else 800.0)
+
+        spread = estimate_spread(liquidity)
+        ask_price = min(current_price + spread / 2, 0.999)
+        net_profit_pct = (1.0 - ask_price) - fee_rate
+
+        if net_profit_pct < min_profit_net:
+            skipped_spread += 1
+            continue
+
+        if available_capital < 5.0:
+            break
+        position_usdc = kelly_size(available_capital, current_price, ask_price, kelly_fraction, max_position_pct)
+        available_capital -= position_usdc
+        shares = position_usdc / ask_price
+        protocol_fee = position_usdc * fee_rate
+        breakeven = ask_price + fee_rate
+
+        volume_24h = float(m.get("volume24hr") or 0)
+        market_url = f"https://polymarket.com/event/{m.get('slug', '')}"
+
+        cur.execute("""
+            INSERT INTO signals (
+                detected_at, token_id, question, market_url, closes_at,
+                hours_to_close, entry_price, ask_price, spread_entry_pct,
+                net_profit_pct, position_usdc, shares, protocol_fee,
+                breakeven_price, liquidity, volume_24h, wash_score, status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            datetime.now(timezone.utc).isoformat(),
+            token_id_yes, question, market_url,
+            end_date_str, hours_to_close,
+            current_price, ask_price, spread,
+            net_profit_pct, position_usdc, shares, protocol_fee,
+            breakeven, liquidity, volume_24h, "ok", "open"
+        ))
+        conn.commit()
+        new_signals += 1
+
+        q_short = (question[:52] + "…") if len(question) > 52 else question.ljust(53)
+        console.print(
+            f"  🎯  [bold]{q_short}[/bold]  "
+            f"[cyan]${current_price:.4f}[/cyan]  "
+            f"[yellow]${position_usdc:.2f}[/yellow]  "
+            f"closes in [white]{hours_to_close:.1f}h[/white]  "
+            f"net=[green]+{net_profit_pct*100:.2f}%[/green]"
+        )
+
+    # Update scan_log
+    finished_at = datetime.now(timezone.utc).isoformat()
+    duration_sec = round(_time.time() - scan_start, 1)
+    conn.execute("""
+        UPDATE scan_log SET
+            finished_at=?, duration_sec=?,
+            markets_fetched=?, markets_checked=?,
+            signals_found=?, signals_resolved=?,
+            skipped_wash=?, skipped_spread=?,
+            skipped_no_data=?, skipped_price=?
+        WHERE id=?
+    """, (
+        finished_at, duration_sec,
+        len(markets), markets_checked,
+        new_signals, resolved_count,
+        skipped_wash, skipped_spread,
+        skipped_no_data, skipped_price,
+        scan_log_id,
+    ))
+    conn.commit()
+
+    console.print(f"\n[bold]Bond Hunter paper scan complete.[/bold]")
+    console.print(f"  Markets downloaded:   [cyan]{len(markets)}[/cyan]")
+    console.print(f"  Markets analyzed:     [cyan]{markets_checked}[/cyan]")
+    console.print(f"  New signals:          [green]{new_signals}[/green]")
+    console.print(f"  Signals resolved:     [green]{resolved_count}[/green]")
+    console.print(f"  Skipped (wash):       [dim]{skipped_wash}[/dim]")
+    console.print(f"  Skipped (spread):     [dim]{skipped_spread}[/dim]")
+    console.print(f"  No CLOB data:         [dim]{skipped_no_data}[/dim]")
+    console.print(f"  Price out of range:   [dim]{skipped_price}[/dim]")
+    console.print(f"  Duration:             [dim]{duration_sec}s[/dim]\n")

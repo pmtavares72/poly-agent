@@ -20,6 +20,13 @@ if [ -f "$LOG_DIR/frontend.pid" ]; then
 fi
 pkill -f "next start" 2>/dev/null || true
 
+# Parar IFNL-Lite runner
+if [ -f "$LOG_DIR/ifnl_lite.pid" ]; then
+  kill $(cat "$LOG_DIR/ifnl_lite.pid") 2>/dev/null && echo "  ✓ IFNL-Lite runner stopped"
+  rm "$LOG_DIR/ifnl_lite.pid"
+fi
+pkill -f "ifnl_runner" 2>/dev/null || true
+
 # Eliminar cron
 ( crontab -l 2>/dev/null | grep -v "agent.py" ) | crontab -
 echo "  ✓ Cron removed"

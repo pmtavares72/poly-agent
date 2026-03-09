@@ -10,6 +10,7 @@ Uso:
 Swagger UI: http://localhost:8765/docs
 """
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -21,8 +22,13 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from strategies import get_strategy, STRATEGY_REGISTRY
+
 DB_PATH = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.db")
 AGENT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.py")
+
+# Track running continuous strategy processes {slug: subprocess.Popen}
+_running_processes: dict[str, subprocess.Popen] = {}
 
 app = FastAPI(
     title="PolyAgent API",
@@ -274,6 +280,10 @@ def get_stats():
     cfg_row = cur.fetchone()
     base_capital = float(cfg_row[0]) if cfg_row else 500.0
 
+    # Get active strategies count
+    cur.execute("SELECT COUNT(*) FROM strategies WHERE enabled=1")
+    active_strategies = cur.fetchone()[0] or 0
+
     total      = scalar("SELECT COUNT(*) FROM signals")
     open_c     = scalar("SELECT COUNT(*) FROM signals WHERE status='open'")
     resolved_c = scalar("SELECT COUNT(*) FROM signals WHERE status='resolved'")
@@ -322,8 +332,231 @@ def get_stats():
         "bot_last_scan":  bot.get("last_scan_at"),
         "bot_scan_count": bot.get("scan_count", 0),
         "bot_last_error": bot.get("last_error"),
+        "active_strategies": active_strategies,
         "generated_at":   datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ─────────────────────────────────────────────
+# STRATEGIES
+# ─────────────────────────────────────────────
+
+@app.get("/strategies")
+def list_strategies():
+    """List all registered strategies with their status."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM strategies ORDER BY slug")
+    data = rows(cur)
+    conn.close()
+    # Parse config_json, merge with strategy defaults
+    for s in data:
+        try:
+            stored = json.loads(s.get("config_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            stored = {}
+        strategy = get_strategy(s["slug"])
+        defaults = strategy.default_config() if strategy else {}
+        s["config"] = {**defaults, **stored}
+    return {"strategies": data}
+
+
+@app.get("/strategies/{slug}")
+def get_strategy_detail(slug: str):
+    """Get strategy detail including config and stats."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM strategies WHERE slug=?", (slug,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Strategy '{slug}' not found")
+    result = dict(row)
+    try:
+        stored = json.loads(result.get("config_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        stored = {}
+    strategy = get_strategy(slug)
+    defaults = strategy.default_config() if strategy else {}
+    result["config"] = {**defaults, **stored}
+
+    # Get strategy stats
+    if strategy:
+        result["stats"] = strategy.get_stats(conn)
+    else:
+        result["stats"] = {}
+
+    # For continuous strategies, report if runner process is alive
+    proc = _running_processes.get(slug)
+    result["runner_alive"] = proc is not None and proc.poll() is None
+
+    conn.close()
+    return result
+
+
+@app.post("/strategies/{slug}/config")
+def update_strategy_config(slug: str, config: dict):
+    """Update strategy-specific config."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT config_json FROM strategies WHERE slug=?", (slug,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Strategy '{slug}' not found")
+
+    # Merge with existing config
+    existing = json.loads(row["config_json"] or "{}")
+    existing.update(config)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        "UPDATE strategies SET config_json=?, updated_at=? WHERE slug=?",
+        (json.dumps(existing), now_iso, slug)
+    )
+    conn.commit()
+    conn.close()
+    return {"slug": slug, "config": existing, "updated_at": now_iso}
+
+
+@app.post("/strategies/{slug}/enable")
+def enable_strategy(slug: str):
+    """Enable a strategy. For continuous strategies, also starts the runner process."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT slug, type FROM strategies WHERE slug=?", (slug,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Strategy '{slug}' not found")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE strategies SET enabled=1, updated_at=? WHERE slug=?", (now_iso, slug))
+    conn.commit()
+    conn.close()
+
+    pid = None
+    # Start continuous strategy runner process
+    if row["type"] == "continuous" and slug == "ifnl_lite":
+        # Kill existing process if any
+        _stop_continuous_process(slug)
+        try:
+            log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "ifnl_lite.log")
+            log_file = open(log_path, "a")
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "strategies.ifnl_lite.ifnl_runner", "--db", DB_PATH],
+                stdout=log_file,
+                stderr=log_file,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            _running_processes[slug] = proc
+            pid = proc.pid
+            # Write PID file for stop.sh / start.sh
+            pid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", f"{slug}.pid")
+            with open(pid_path, "w") as pf:
+                pf.write(str(pid))
+        except Exception as e:
+            return {"slug": slug, "enabled": True, "error": f"Enabled but failed to start runner: {e}"}
+
+    return {"slug": slug, "enabled": True, "pid": pid}
+
+
+@app.post("/strategies/{slug}/disable")
+def disable_strategy(slug: str):
+    """Disable a strategy. For continuous strategies, also stops the runner process."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT slug, type FROM strategies WHERE slug=?", (slug,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Strategy '{slug}' not found")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE strategies SET enabled=0, updated_at=? WHERE slug=?", (now_iso, slug))
+    conn.commit()
+    conn.close()
+
+    # Stop continuous strategy runner process
+    if row["type"] == "continuous":
+        _stop_continuous_process(slug)
+
+    return {"slug": slug, "enabled": False}
+
+
+def _stop_continuous_process(slug: str):
+    """Stop a running continuous strategy process."""
+    proc = _running_processes.pop(slug, None)
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    # Clean up PID file
+    pid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", f"{slug}.pid")
+    if os.path.exists(pid_path):
+        os.remove(pid_path)
+
+
+@app.post("/strategies/{slug}/scan-now")
+def strategy_scan_now(slug: str):
+    """Trigger an immediate scan for a cron-type strategy."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT type, enabled FROM strategies WHERE slug=?", (slug,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Strategy '{slug}' not found")
+    if row["type"] != "cron":
+        raise HTTPException(status_code=400, detail=f"Strategy '{slug}' is continuous, not cron-based")
+    if not row["enabled"]:
+        raise HTTPException(status_code=400, detail=f"Strategy '{slug}' is disabled — enable it first")
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, AGENT_SCRIPT, "--mode", "paper", "--strategy", slug, "--force"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {"triggered": True, "pid": proc.pid, "strategy": slug,
+                "message": f"Scan launched (pid={proc.pid})"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to launch scan: {e}")
+
+
+@app.get("/strategies/{slug}/signals")
+def get_strategy_signals(
+    slug: str,
+    status: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0),
+):
+    """Get signals for a specific strategy."""
+    strategy = get_strategy(slug)
+    if not strategy:
+        raise HTTPException(status_code=404, detail=f"Strategy '{slug}' not found")
+    conn = get_conn()
+    result = strategy.get_signals(conn, status=status, limit=limit, offset=offset)
+    conn.close()
+    return result
+
+
+@app.get("/strategies/{slug}/signals/open")
+def get_strategy_open_signals(slug: str, limit: int = Query(100, le=500), offset: int = Query(0)):
+    return get_strategy_signals(slug, status="open", limit=limit, offset=offset)
+
+
+@app.get("/strategies/{slug}/stats")
+def get_strategy_stats(slug: str):
+    """Get stats for a specific strategy."""
+    strategy = get_strategy(slug)
+    if not strategy:
+        raise HTTPException(status_code=404, detail=f"Strategy '{slug}' not found")
+    conn = get_conn()
+    stats = strategy.get_stats(conn)
+    conn.close()
+    return stats
 
 
 # ─────────────────────────────────────────────

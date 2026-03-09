@@ -1,10 +1,16 @@
 'use client'
 import { AppShell } from '@/components/layout/AppShell'
 import { BondHunterCard } from '@/components/strategies/BondHunterCard'
+import { IfnlLiteCard } from '@/components/strategies/IfnlLiteCard'
 import { useStats } from '@/hooks/useStats'
+import { useStrategies } from '@/hooks/useStrategies'
 
 export default function StrategiesPage() {
   const { stats } = useStats()
+  const { strategies } = useStrategies()
+
+  const strategyCount = strategies?.length ?? 0
+  const activeCount = strategies?.filter(s => s.enabled).length ?? 0
 
   return (
     <AppShell activePage="strategies" title="Strategies">
@@ -16,19 +22,13 @@ export default function StrategiesPage() {
         <div>
           <div style={{ fontSize: 22, fontWeight: 800, letterSpacing: '-0.01em' }}>Strategies</div>
           <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text3)', marginTop: 4 }}>
-            1 strategy · paper trading mode
+            {strategyCount} {strategyCount === 1 ? 'strategy' : 'strategies'} · {activeCount} active · paper trading mode
           </div>
         </div>
-        <button className="btn-new" style={{
-          display: 'flex', alignItems: 'center', gap: 6,
-          padding: '9px 16px', background: 'var(--green)', color: '#000',
-          border: 'none', borderRadius: 8, fontFamily: 'var(--sans)',
-          fontSize: 12, fontWeight: 700, cursor: 'pointer',
-          boxShadow: '0 0 20px var(--green-glow)',
-        }}>+ New Strategy</button>
       </div>
 
       <BondHunterCard stats={stats} />
+      <IfnlLiteCard />
     </AppShell>
   )
 }
