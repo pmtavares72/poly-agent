@@ -1,7 +1,7 @@
 'use client'
 import { useState } from 'react'
 import dynamic from 'next/dynamic'
-import { useStrategy, useStrategySignals, useStrategyStats } from '@/hooks/useStrategies'
+import { useStrategy, useStrategySignals, useStrategyStats, useStrategyActivity } from '@/hooks/useStrategies'
 import { enableStrategy, disableStrategy } from '@/lib/api'
 import { KpiCard } from './KpiCard'
 import { Badge } from '@/components/ui/Badge'
@@ -158,9 +158,140 @@ function IfnlSignalsTable({ signals }: { signals: IfnlSignal[] }) {
   )
 }
 
+function formatUptime(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  return `${h}h ${m}m`
+}
+
+function IfnlActivityPanel({ activity }: { activity: Record<string, unknown> }) {
+  const running = Boolean(activity.running)
+  const uptime = Number(activity.uptime_seconds ?? 0)
+  const wsConnected = Boolean(activity.ws_connected)
+  const markets = Number(activity.markets_monitored ?? 0)
+  const trades = Number(activity.trades_captured ?? 0)
+  const wallets = Number(activity.unique_wallets_seen ?? 0)
+  const signals = Number(activity.signals_generated ?? 0)
+  const flows = Number(activity.active_flow_entries ?? 0)
+  const books = Number(activity.book_states ?? 0)
+  const stale = Boolean(activity.possibly_stale)
+  const marketNames = (activity.market_names ?? []) as string[]
+
+  const items: { label: string; value: string; status: 'ok' | 'warn' | 'off' }[] = [
+    { label: 'Process', value: running ? 'Running' : 'Stopped', status: running ? 'ok' : 'off' },
+    { label: 'Uptime', value: formatUptime(uptime), status: running ? 'ok' : 'off' },
+    { label: 'WebSocket', value: wsConnected ? 'Connected' : 'Disconnected', status: wsConnected ? 'ok' : 'warn' },
+    { label: 'Markets', value: `${markets} monitored`, status: markets > 0 ? 'ok' : 'warn' },
+    { label: 'Book States', value: String(books), status: books > 0 ? 'ok' : 'warn' },
+    { label: 'Trades Captured', value: String(trades), status: trades > 0 ? 'ok' : 'warn' },
+    { label: 'Wallets Seen', value: String(wallets), status: wallets > 0 ? 'ok' : 'warn' },
+    { label: 'Flow Entries', value: String(flows), status: flows > 0 ? 'ok' : 'off' },
+    { label: 'Signals Generated', value: String(signals), status: signals > 0 ? 'ok' : 'off' },
+  ]
+
+  const statusColors = { ok: '#00e87a', warn: '#f0b429', off: 'var(--text3)' }
+
+  return (
+    <div style={{
+      background: 'var(--surface)',
+      border: '1px solid var(--border)',
+      borderRadius: 14,
+      padding: '18px 22px',
+      marginBottom: 24,
+    }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        marginBottom: 16,
+      }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>
+          Engine Activity
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {stale && (
+            <span style={{
+              fontFamily: 'var(--mono)', fontSize: 9, color: '#f0b429',
+              padding: '2px 6px', borderRadius: 4,
+              background: 'rgba(240,180,41,0.1)',
+              border: '1px solid rgba(240,180,41,0.2)',
+            }}>STALE</span>
+          )}
+          <span style={{
+            fontFamily: 'var(--mono)', fontSize: 9, color: running ? '#00e87a' : 'var(--text3)',
+            letterSpacing: '0.06em',
+          }}>
+            {running ? '● LIVE' : '○ OFFLINE'}
+          </span>
+        </div>
+      </div>
+
+      {/* Status grid */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))',
+        gap: 10,
+        marginBottom: marketNames.length > 0 ? 16 : 0,
+      }}>
+        {items.map(({ label, value, status }) => (
+          <div key={label} style={{
+            background: 'var(--surface2)',
+            borderRadius: 8,
+            padding: '10px 12px',
+            border: '1px solid var(--border)',
+          }}>
+            <div style={{
+              fontFamily: 'var(--mono)', fontSize: 8, color: 'var(--text3)',
+              textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 4,
+            }}>
+              {label}
+            </div>
+            <div style={{
+              fontFamily: 'var(--mono)', fontSize: 12, fontWeight: 600,
+              color: statusColors[status],
+            }}>
+              {value}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Monitored markets */}
+      {marketNames.length > 0 && (
+        <div>
+          <div style={{
+            fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text3)',
+            textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 8,
+          }}>
+            Monitored Markets
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {marketNames.map((name, i) => (
+              <span key={i} style={{
+                fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text2)',
+                background: 'var(--surface2)',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                padding: '3px 8px',
+                maxWidth: 280,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}>
+                {name.length > 55 ? name.slice(0, 55) + '...' : name}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function IfnlDashboard() {
   const { strategy, mutate: mutateStrategy } = useStrategy('ifnl_lite')
   const { stats, isLoading: statsLoading } = useStrategyStats('ifnl_lite')
+  const { activity } = useStrategyActivity('ifnl_lite')
   const { signals: openSignals } = useStrategySignals('ifnl_lite', { status: 'open', limit: 20 })
   const { signals: recentSignals } = useStrategySignals('ifnl_lite', { limit: 30 })
   const [toggling, setToggling] = useState(false)
@@ -296,6 +427,11 @@ export function IfnlDashboard() {
           }}>⚠ {actionError}</div>
         )}
       </div>
+
+      {/* Live Activity Panel */}
+      {isEnabled && activity && (
+        <IfnlActivityPanel activity={activity} />
+      )}
 
       {/* KPIs */}
       <div className="kpi-grid" style={{

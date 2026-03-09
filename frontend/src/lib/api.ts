@@ -74,4 +74,5 @@ export const fetchStrategySignals  = (slug: string, params?: { status?: string; 
   return get<SignalsResponse>(`/strategies/${slug}/signals${qs ? `?${qs}` : ''}`)
 }
 export const fetchStrategyStats    = (slug: string) => get<Record<string, unknown>>(`/strategies/${slug}/stats`)
+export const fetchStrategyActivity = (slug: string) => get<Record<string, unknown>>(`/strategies/${slug}/activity`)
 

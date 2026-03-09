@@ -15,6 +15,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -557,6 +558,25 @@ def get_strategy_stats(slug: str):
     stats = strategy.get_stats(conn)
     conn.close()
     return stats
+
+
+@app.get("/strategies/{slug}/activity")
+def get_strategy_activity(slug: str):
+    """Get live activity/status of a running strategy (reads status file from runner)."""
+    status_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", f"{slug}_status.json")
+    if not os.path.exists(status_file):
+        return {"running": False, "message": "No status file — strategy may not have been started yet"}
+    try:
+        with open(status_file, "r") as f:
+            data = json.load(f)
+        # Check if status is stale (>60s old)
+        last_update = data.get("last_status_update", 0)
+        if last_update and (time.time() - last_update) > 60:
+            data["possibly_stale"] = True
+            data["stale_seconds"] = int(time.time() - last_update)
+        return data
+    except (json.JSONDecodeError, IOError):
+        return {"running": False, "message": "Status file unreadable"}
 
 
 # ─────────────────────────────────────────────

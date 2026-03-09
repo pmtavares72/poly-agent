@@ -37,6 +37,15 @@ class IfnlRunner:
         self._running = False
         self._config: dict = {}
         self._capital: float = 0.0
+        self._started_at: float = 0.0
+        self._markets_monitored: int = 0
+        self._market_names: list[str] = []
+        self._trades_captured: int = 0
+        self._wallets_seen: set[str] = set()
+        self._signals_generated: int = 0
+        self._last_market_refresh: float = 0.0
+        self._ws_connected: bool = False
+        self._status_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "logs", "ifnl_lite_status.json")
 
         # Components
         self.ws_client = WsClient()
@@ -67,9 +76,51 @@ class IfnlRunner:
             if k not in self._config:
                 self._config[k] = v
 
+    def _write_status(self):
+        """Write live status to JSON file for the API to read."""
+        try:
+            status = {
+                "running": self._running,
+                "started_at": self._started_at,
+                "uptime_seconds": int(time.time() - self._started_at) if self._started_at else 0,
+                "ws_connected": self._ws_connected,
+                "markets_monitored": self._markets_monitored,
+                "market_names": self._market_names[:10],
+                "trades_captured": self._trades_captured,
+                "unique_wallets_seen": len(self._wallets_seen),
+                "signals_generated": self._signals_generated,
+                "last_market_refresh": self._last_market_refresh,
+                "last_status_update": time.time(),
+                "capital": self._capital,
+            }
+            # Gather flow accumulator stats
+            if self.signal_engine:
+                total_flows = sum(
+                    len(acc.flows) for acc in self.signal_engine.flow_accumulators.values()
+                )
+                status["active_flow_entries"] = total_flows
+            # Micro engine stats
+            status["book_states"] = len(self.micro_engine.states) if hasattr(self.micro_engine, 'states') else 0
+
+            os.makedirs(os.path.dirname(self._status_file), exist_ok=True)
+            with open(self._status_file, "w") as f:
+                json.dump(status, f)
+        except Exception as e:
+            logger.debug(f"Failed to write status file: {e}")
+
+    def _on_data_trades(self, market_id: str, trades: list):
+        """Callback wrapper for data API trades — counts and forwards."""
+        self._trades_captured += len(trades)
+        for t in trades:
+            if hasattr(t, 'proxy_wallet') and t.proxy_wallet:
+                self._wallets_seen.add(t.proxy_wallet)
+        if self.signal_engine:
+            self.signal_engine.process_wallet_trades(market_id, trades)
+
     async def run(self):
         """Main entry point — starts all components and runs until stopped."""
         self._running = True
+        self._started_at = time.time()
         self._tasks: list[asyncio.Task] = []
         self._load_config()
 
@@ -87,10 +138,8 @@ class IfnlRunner:
             lambda token_id, price, side: self.micro_engine.on_trade(token_id, price, side)
         )
 
-        # Wire up Data API callbacks to signal engine
-        self.data_api.on_trades(
-            lambda market_id, trades: self.signal_engine.process_wallet_trades(market_id, trades)
-        )
+        # Wire up Data API callbacks — goes through our counting wrapper
+        self.data_api.on_trades(self._on_data_trades)
 
         # Run all tasks concurrently
         self._tasks = [
@@ -99,6 +148,7 @@ class IfnlRunner:
             asyncio.create_task(self.data_api.start()),
             asyncio.create_task(self._signal_loop()),
             asyncio.create_task(self._exit_check_loop()),
+            asyncio.create_task(self._status_loop()),
         ]
         try:
             await asyncio.gather(*self._tasks)
@@ -126,6 +176,13 @@ class IfnlRunner:
             await self.data_api.stop()
         except Exception:
             pass
+        # Write final stopped status
+        try:
+            status = {"running": False, "stopped_at": time.time()}
+            with open(self._status_file, "w") as f:
+                json.dump(status, f)
+        except Exception:
+            pass
         logger.info("IFNL-Lite stopped")
 
     async def _market_selection_loop(self):
@@ -147,12 +204,25 @@ class IfnlRunner:
                     # Update Data API monitoring
                     self.data_api.set_markets(set(token_ids))
 
+                    # Track for status
+                    self._markets_monitored = len(markets)
+                    self._market_names = [m.get("question", m["token_id"][:16]) for m in markets]
+                    self._last_market_refresh = time.time()
+                    self._ws_connected = True
+
                     logger.info(f"Monitoring {len(markets)} markets")
+                    self._write_status()
 
             except Exception as e:
                 logger.error(f"Market selection error: {e}")
 
             await asyncio.sleep(MARKET_REFRESH_INTERVAL)
+
+    async def _status_loop(self):
+        """Write status file every 10 seconds."""
+        while self._running:
+            self._write_status()
+            await asyncio.sleep(10)
 
     async def _signal_loop(self):
         """Check for new signals every 5 seconds."""
@@ -165,6 +235,7 @@ class IfnlRunner:
                 for sig in signals:
                     if self._capital > 0:
                         self.execution.execute_signal(sig, self._capital)
+                        self._signals_generated += 1
             except Exception as e:
                 logger.error(f"Signal generation error: {e}")
 

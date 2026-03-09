@@ -1,6 +1,6 @@
 'use client'
 import useSWR from 'swr'
-import { fetchStrategies, fetchStrategy, fetchStrategySignals, fetchStrategyStats } from '@/lib/api'
+import { fetchStrategies, fetchStrategy, fetchStrategySignals, fetchStrategyStats, fetchStrategyActivity } from '@/lib/api'
 
 export function useStrategies() {
   const { data, error, isLoading, mutate } = useSWR('/strategies', fetchStrategies, {
@@ -35,4 +35,13 @@ export function useStrategyStats(slug: string) {
     { refreshInterval: 15_000, revalidateOnFocus: true }
   )
   return { stats: data, error, isLoading }
+}
+
+export function useStrategyActivity(slug: string) {
+  const { data, error, isLoading } = useSWR(
+    `/strategies/${slug}/activity`,
+    () => fetchStrategyActivity(slug),
+    { refreshInterval: 10_000, revalidateOnFocus: true }
+  )
+  return { activity: data, error, isLoading }
 }
