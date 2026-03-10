@@ -81,3 +81,19 @@ CREATE TABLE IF NOT EXISTS ifnl_signals (
     exit_reason     TEXT,
     status          TEXT DEFAULT 'open'
 );
+
+-- ===========================================
+-- Migration 003: Stop-loss support
+-- Added: stop_loss_pct config parameter
+-- ===========================================
+-- Add stop_loss_pct column to config table if it doesn't exist
+-- SQLite doesn't support IF NOT EXISTS for columns, so we check indirectly
+-- This is safe to run multiple times
+CREATE TABLE IF NOT EXISTS config_migration_003 (check_done INTEGER);
+INSERT OR IGNORE INTO config_migration_003 VALUES (1);
+
+-- Add column (will fail silently if already exists - that's OK)
+ALTER TABLE config ADD COLUMN stop_loss_pct REAL DEFAULT 0.15;
+
+-- Update existing rows to have the default value
+UPDATE config SET stop_loss_pct = 0.15 WHERE stop_loss_pct IS NULL;

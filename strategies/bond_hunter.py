@@ -45,6 +45,7 @@ class BondHunterStrategy(BaseStrategy):
             "kelly_fraction": 0.35,        # was 0.25 — more aggressive sizing
             "max_position_pct": 0.20,      # was 0.15 — larger positions on good signals
             "max_capital_deployed_pct": 0.70,  # was 0.50 — deploy more capital
+            "stop_loss_pct": 0.15,         # Exit position if price drops 15% below entry
             "fee_rate": 0.005,
             "scan_interval_min": 15,
         }
@@ -428,6 +429,109 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
 
 
 # ─────────────────────────────────────────────
+# STOP-LOSS MONITORING
+# ─────────────────────────────────────────────
+
+def monitor_stop_losses(conn: sqlite3.Connection, stop_loss_pct: float = 0.15) -> int:
+    """
+    Monitor open positions and trigger stop-loss if price drops below threshold.
+    
+    For each open signal:
+    1. Fetch current market price
+    2. If price < entry_price * (1 - stop_loss_pct), exit position
+    3. Record partial loss in database
+    
+    Args:
+        conn: Database connection
+        stop_loss_pct: Stop-loss trigger threshold (default 15%)
+    
+    Returns:
+        Number of positions stopped out
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, token_id, question, ask_price, position_usdc, shares, protocol_fee, detected_at
+        FROM signals 
+        WHERE status='open'
+    """)
+    open_positions = cur.fetchall()
+    
+    if not open_positions:
+        return 0
+    
+    stopped_count = 0
+    now = datetime.now(timezone.utc)
+    
+    console.print(f"\n[cyan]Monitoring {len(open_positions)} open positions for stop-loss...[/cyan]")
+    
+    for row in open_positions:
+        sig_id = row["id"]
+        token_id = row["token_id"]
+        question = row["question"]
+        entry_price = row["ask_price"]
+        position_usdc = row["position_usdc"]
+        shares = row["shares"]
+        protocol_fee = row["protocol_fee"]
+        detected_at = row["detected_at"]
+        
+        # Calculate stop-loss trigger price
+        stop_price = entry_price * (1 - stop_loss_pct)
+        
+        # Fetch current market price
+        data = safe_get(CLOB_LAST_TRADE, {"token_id": token_id})
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+        
+        if not data:
+            continue
+        
+        try:
+            current_price = float(data.get("price", 0))
+        except (TypeError, ValueError):
+            continue
+        
+        # Check if stop-loss triggered
+        if current_price < stop_price:
+            # Calculate exit value and loss
+            exit_value = (shares or 0) * current_price
+            pnl = exit_value - (position_usdc or 0) - (protocol_fee or 0)
+            pnl_pct = (pnl / position_usdc * 100) if position_usdc else 0
+            
+            # Calculate time held
+            try:
+                detected_dt = datetime.fromisoformat(detected_at.replace("Z", "+00:00"))
+                hours_held = (now - detected_dt).total_seconds() / 3600
+            except:
+                hours_held = 0
+            
+            q_short = (question[:50] + "…") if question and len(question) > 50 else question
+            console.print(
+                f"  🛑  [bold red]STOP-LOSS[/bold red]  {q_short}\n"
+                f"      Entry: {entry_price:.4f} → Current: {current_price:.4f} ({((current_price/entry_price-1)*100):.1f}%)\n"
+                f"      Exit value: ${exit_value:.2f} | Loss: ${abs(pnl):.2f} ({pnl_pct:.1f}%) | Held: {hours_held:.1f}h"
+            )
+            
+            # Update signal in database
+            cur.execute("""
+                UPDATE signals SET 
+                    outcome='STOP_LOSS',
+                    resolved_at=?,
+                    pnl_usdc=?,
+                    pnl_pct=?,
+                    status='resolved'
+                WHERE id=?
+            """, (now.isoformat(), pnl, pnl_pct, sig_id))
+            conn.commit()
+            stopped_count += 1
+    
+    if stopped_count > 0:
+        console.print(f"\n[yellow]⚠ Stopped out {stopped_count} position(s)[/yellow]")
+    else:
+        console.print(f"[green]✓ All positions above stop-loss threshold[/green]")
+    
+    return stopped_count
+
+
+# ─────────────────────────────────────────────
 # PAPER TRADING SCAN
 # ─────────────────────────────────────────────
 
@@ -446,6 +550,7 @@ def run_paper(conn: sqlite3.Connection, config: dict):
     kelly_fraction = config.get("kelly_fraction", 0.25)
     max_position_pct = config.get("max_position_pct", 0.15)
     max_capital_deployed_pct = config.get("max_capital_deployed_pct", 0.50)
+    stop_loss_pct = config.get("stop_loss_pct", 0.15)  # Default 15% stop-loss
 
     import time as _time
     scan_start = _time.time()
@@ -462,6 +567,9 @@ def run_paper(conn: sqlite3.Connection, config: dict):
 
     # Resolve pending signals first
     resolved_count = resolve_pending_signals(conn)
+    
+    # Monitor stop-losses on open positions
+    stopped_count = monitor_stop_losses(conn, stop_loss_pct)
 
     # Check available capital
     cur_cap = conn.cursor()
@@ -625,6 +733,8 @@ def run_paper(conn: sqlite3.Connection, config: dict):
     console.print(f"  Markets analyzed:     [cyan]{markets_checked}[/cyan]")
     console.print(f"  New signals:          [green]{new_signals}[/green]")
     console.print(f"  Signals resolved:     [green]{resolved_count}[/green]")
+    if stopped_count > 0:
+        console.print(f"  Stop-loss triggered:  [yellow]{stopped_count}[/yellow]")
     console.print(f"  Skipped (wash):       [dim]{skipped_wash}[/dim]")
     console.print(f"  Skipped (spread):     [dim]{skipped_spread}[/dim]")
     console.print(f"  No CLOB data:         [dim]{skipped_no_data}[/dim]")
