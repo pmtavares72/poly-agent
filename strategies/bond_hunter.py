@@ -1,8 +1,14 @@
 """
 Bond Hunter Strategy
 ====================
-Buys YES tokens in binary markets at 0.95-0.995, holds until resolution (~48h),
+Buys YES tokens in binary markets at 0.92-0.995, holds until resolution,
 exits at 1.0 for small but consistent returns.
+
+Risk model:
+- Win rate must exceed breakeven threshold (e.g., at 0.95 entry, need >95.2% wins)
+- Protection comes from SELECTION, not stop-losses
+- Diversify: many small positions across uncorrelated markets
+- Higher probability = larger position (confidence scaling)
 """
 
 import json
@@ -37,15 +43,16 @@ class BondHunterStrategy(BaseStrategy):
     def default_config(self) -> dict:
         return {
             "initial_capital": 500.0,
-            "min_probability": 0.92,       # was 0.95 — wider range captures more markets
+            "min_probability": 0.92,
             "max_probability": 0.995,
-            "min_profit_net": 0.010,       # was 0.015 — accept thinner edge (1% net)
-            "max_hours_to_close": 168.0,   # was 48h — allow up to 7 days (more markets)
-            "min_liquidity_usdc": 300.0,   # was 500 — more markets eligible
-            "kelly_fraction": 0.35,        # was 0.25 — more aggressive sizing
-            "max_position_pct": 0.20,      # was 0.15 — larger positions on good signals
-            "max_capital_deployed_pct": 0.70,  # was 0.50 — deploy more capital
-            "stop_loss_pct": 0.15,         # Exit position if price drops 15% below entry
+            "min_profit_net": 0.015,        # 1.5% min edge (after fees) — need >94% WR
+            "max_hours_to_close": 168.0,     # up to 7 days
+            "min_liquidity_usdc": 300.0,
+            "kelly_fraction": 0.35,
+            "max_position_pct": 0.20,        # max 20% of capital per trade
+            "max_capital_deployed_pct": 0.70, # deploy up to 70%
+            "max_per_market_pct": 0.20,      # max exposure per single market
+            "min_unique_traders": 10,         # skip thinly traded markets
             "fee_rate": 0.005,
             "scan_interval_min": 15,
         }
@@ -321,22 +328,24 @@ def estimate_spread(liquidity: float) -> float:
 def kelly_size(capital: float, entry_price: float, ask_price: float,
                kelly_fraction: float, max_pct: float) -> float:
     """
-    Position sizing for Bond Hunter.
+    Position sizing for Bond Hunter with confidence scaling.
 
-    Classic Kelly uses market price as win probability, which gives kelly_f ≈ 0
-    for near-certain markets (the spread eats all the edge). Bond Hunter's thesis
-    is that these markets resolve YES with ~99% certainty, so we use an assumed
-    win probability higher than the market price.
-
-    For markets at 0.92-0.995, we assume true win probability = 0.995.
+    Uses assumed win probability of 0.995 (Bond Hunter thesis: these markets
+    resolve YES with near certainty). Position scales up with market probability
+    — a market at 0.98 is more certain than 0.92, so deserves larger allocation.
     """
-    # Bond Hunter edge: we believe win prob is higher than market price
     assumed_win_prob = 0.995
     b = (1.0 - ask_price) / ask_price  # payout odds
     p = assumed_win_prob
     q = 1.0 - p
     kelly_f = max(0.0, (b * p - q) / b)
-    position = capital * kelly_fraction * kelly_f
+
+    # Confidence scaling: higher entry_price = more certain = scale up
+    # At 0.92: multiplier ~0.7, at 0.97: ~1.0, at 0.99: ~1.1
+    confidence_mult = 0.5 + (entry_price - 0.90) * 5.0  # linear 0.6-1.0 range
+    confidence_mult = max(0.6, min(1.1, confidence_mult))
+
+    position = capital * kelly_fraction * kelly_f * confidence_mult
     position = min(position, capital * max_pct)
     position = max(position, 5.0)
     return position
@@ -429,109 +438,6 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
 
 
 # ─────────────────────────────────────────────
-# STOP-LOSS MONITORING
-# ─────────────────────────────────────────────
-
-def monitor_stop_losses(conn: sqlite3.Connection, stop_loss_pct: float = 0.15) -> int:
-    """
-    Monitor open positions and trigger stop-loss if price drops below threshold.
-    
-    For each open signal:
-    1. Fetch current market price
-    2. If price < entry_price * (1 - stop_loss_pct), exit position
-    3. Record partial loss in database
-    
-    Args:
-        conn: Database connection
-        stop_loss_pct: Stop-loss trigger threshold (default 15%)
-    
-    Returns:
-        Number of positions stopped out
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, token_id, question, ask_price, position_usdc, shares, protocol_fee, detected_at
-        FROM signals 
-        WHERE status='open'
-    """)
-    open_positions = cur.fetchall()
-    
-    if not open_positions:
-        return 0
-    
-    stopped_count = 0
-    now = datetime.now(timezone.utc)
-    
-    console.print(f"\n[cyan]Monitoring {len(open_positions)} open positions for stop-loss...[/cyan]")
-    
-    for row in open_positions:
-        sig_id = row["id"]
-        token_id = row["token_id"]
-        question = row["question"]
-        entry_price = row["ask_price"]
-        position_usdc = row["position_usdc"]
-        shares = row["shares"]
-        protocol_fee = row["protocol_fee"]
-        detected_at = row["detected_at"]
-        
-        # Calculate stop-loss trigger price
-        stop_price = entry_price * (1 - stop_loss_pct)
-        
-        # Fetch current market price
-        data = safe_get(CLOB_LAST_TRADE, {"token_id": token_id})
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-        
-        if not data:
-            continue
-        
-        try:
-            current_price = float(data.get("price", 0))
-        except (TypeError, ValueError):
-            continue
-        
-        # Check if stop-loss triggered
-        if current_price < stop_price:
-            # Calculate exit value and loss
-            exit_value = (shares or 0) * current_price
-            pnl = exit_value - (position_usdc or 0) - (protocol_fee or 0)
-            pnl_pct = (pnl / position_usdc * 100) if position_usdc else 0
-            
-            # Calculate time held
-            try:
-                detected_dt = datetime.fromisoformat(detected_at.replace("Z", "+00:00"))
-                hours_held = (now - detected_dt).total_seconds() / 3600
-            except:
-                hours_held = 0
-            
-            q_short = (question[:50] + "…") if question and len(question) > 50 else question
-            console.print(
-                f"  🛑  [bold red]STOP-LOSS[/bold red]  {q_short}\n"
-                f"      Entry: {entry_price:.4f} → Current: {current_price:.4f} ({((current_price/entry_price-1)*100):.1f}%)\n"
-                f"      Exit value: ${exit_value:.2f} | Loss: ${abs(pnl):.2f} ({pnl_pct:.1f}%) | Held: {hours_held:.1f}h"
-            )
-            
-            # Update signal in database
-            cur.execute("""
-                UPDATE signals SET 
-                    outcome='STOP_LOSS',
-                    resolved_at=?,
-                    pnl_usdc=?,
-                    pnl_pct=?,
-                    status='resolved'
-                WHERE id=?
-            """, (now.isoformat(), pnl, pnl_pct, sig_id))
-            conn.commit()
-            stopped_count += 1
-    
-    if stopped_count > 0:
-        console.print(f"\n[yellow]⚠ Stopped out {stopped_count} position(s)[/yellow]")
-    else:
-        console.print(f"[green]✓ All positions above stop-loss threshold[/green]")
-    
-    return stopped_count
-
-
-# ─────────────────────────────────────────────
 # PAPER TRADING SCAN
 # ─────────────────────────────────────────────
 
@@ -540,17 +446,17 @@ def run_paper(conn: sqlite3.Connection, config: dict):
     Paper trading mode: scan open markets, detect Bond Hunter signals,
     record in signals table without executing real orders.
     """
-    min_prob = config.get("min_probability", config.get("min_prob", 0.95))
+    min_prob = config.get("min_probability", config.get("min_prob", 0.92))
     max_prob = config.get("max_probability", config.get("max_prob", 0.995))
-    min_profit_net = config.get("min_profit_net", 0.015)
-    max_hours = config.get("max_hours_to_close", config.get("max_hours", 48.0))
-    min_liquidity = config.get("min_liquidity_usdc", config.get("min_liquidity", 500.0))
+    min_profit_net = config.get("min_profit_net", 0.008)
+    max_hours = config.get("max_hours_to_close", config.get("max_hours", 168.0))
+    min_liquidity = config.get("min_liquidity_usdc", config.get("min_liquidity", 300.0))
     fee_rate = config.get("fee_rate", 0.005)
     capital = config.get("initial_capital", 500.0)
-    kelly_fraction = config.get("kelly_fraction", 0.25)
-    max_position_pct = config.get("max_position_pct", 0.15)
-    max_capital_deployed_pct = config.get("max_capital_deployed_pct", 0.50)
-    stop_loss_pct = config.get("stop_loss_pct", 0.15)  # Default 15% stop-loss
+    kelly_fraction = config.get("kelly_fraction", 0.35)
+    max_position_pct = config.get("max_position_pct", 0.20)
+    max_capital_deployed_pct = config.get("max_capital_deployed_pct", 0.70)
+    min_unique_traders = config.get("min_unique_traders", 10)
 
     import time as _time
     scan_start = _time.time()
@@ -567,9 +473,6 @@ def run_paper(conn: sqlite3.Connection, config: dict):
 
     # Resolve pending signals first
     resolved_count = resolve_pending_signals(conn)
-    
-    # Monitor stop-losses on open positions
-    stopped_count = monitor_stop_losses(conn, stop_loss_pct)
 
     # Check available capital
     cur_cap = conn.cursor()
@@ -578,6 +481,13 @@ def run_paper(conn: sqlite3.Connection, config: dict):
     max_deployable = capital * max_capital_deployed_pct
     available_capital = max(0.0, max_deployable - committed_usdc)
     deployed_pct = (committed_usdc / capital * 100) if capital > 0 else 0
+
+    # Build set of markets with recent losses (cooldown: skip for 24h)
+    cur_cap.execute("""
+        SELECT token_id FROM signals
+        WHERE outcome='NO' AND resolved_at > datetime('now', '-24 hours')
+    """)
+    recent_loss_tokens = {row[0] for row in cur_cap.fetchall()}
 
     if committed_usdc >= max_deployable:
         console.print(
@@ -602,6 +512,7 @@ def run_paper(conn: sqlite3.Connection, config: dict):
     skipped_spread = 0
     skipped_no_data = 0
     skipped_price = 0
+    skipped_quality = 0
 
     for m in markets:
         question = m.get("question", m.get("title", "Unknown"))
@@ -613,9 +524,19 @@ def run_paper(conn: sqlite3.Connection, config: dict):
         token_id_yes = token_or_reason
         markets_checked += 1
 
+        # Skip markets where we recently lost
+        if token_id_yes in recent_loss_tokens:
+            continue
+
         is_wash, _ = compute_wash_score(m)
         if is_wash:
             skipped_wash += 1
+            continue
+
+        # Minimum unique traders filter
+        traders = int(m.get("uniqueTraderCount", 0) or m.get("unique_traders_count", 0) or 0)
+        if traders < min_unique_traders:
+            skipped_quality += 1
             continue
 
         end_date_str = m.get("endDate") or m.get("endDateIso") or ""
@@ -645,6 +566,13 @@ def run_paper(conn: sqlite3.Connection, config: dict):
         if not (min_prob <= current_price <= max_prob):
             skipped_price += 1
             continue
+
+        # Price stability check: reject if price dropped >3% in last 10 min
+        if len(history) >= 2:
+            oldest_price = float(history[0]["p"])
+            if oldest_price > 0 and (current_price - oldest_price) / oldest_price < -0.03:
+                skipped_quality += 1
+                continue
 
         cur = conn.cursor()
         cur.execute("SELECT id FROM signals WHERE token_id=? AND status='open'", (token_id_yes,))
@@ -733,9 +661,8 @@ def run_paper(conn: sqlite3.Connection, config: dict):
     console.print(f"  Markets analyzed:     [cyan]{markets_checked}[/cyan]")
     console.print(f"  New signals:          [green]{new_signals}[/green]")
     console.print(f"  Signals resolved:     [green]{resolved_count}[/green]")
-    if stopped_count > 0:
-        console.print(f"  Stop-loss triggered:  [yellow]{stopped_count}[/yellow]")
     console.print(f"  Skipped (wash):       [dim]{skipped_wash}[/dim]")
+    console.print(f"  Skipped (quality):    [dim]{skipped_quality}[/dim]")
     console.print(f"  Skipped (spread):     [dim]{skipped_spread}[/dim]")
     console.print(f"  No CLOB data:         [dim]{skipped_no_data}[/dim]")
     console.print(f"  Price out of range:   [dim]{skipped_price}[/dim]")
