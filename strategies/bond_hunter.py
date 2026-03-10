@@ -446,17 +446,21 @@ def run_paper(conn: sqlite3.Connection, config: dict):
     Paper trading mode: scan open markets, detect Bond Hunter signals,
     record in signals table without executing real orders.
     """
-    min_prob = config.get("min_probability", config.get("min_prob", 0.92))
-    max_prob = config.get("max_probability", config.get("max_prob", 0.995))
-    min_profit_net = config.get("min_profit_net", 0.008)
-    max_hours = config.get("max_hours_to_close", config.get("max_hours", 168.0))
-    min_liquidity = config.get("min_liquidity_usdc", config.get("min_liquidity", 300.0))
-    fee_rate = config.get("fee_rate", 0.005)
-    capital = config.get("initial_capital", 500.0)
-    kelly_fraction = config.get("kelly_fraction", 0.35)
-    max_position_pct = config.get("max_position_pct", 0.20)
-    max_capital_deployed_pct = config.get("max_capital_deployed_pct", 0.70)
-    min_unique_traders = config.get("min_unique_traders", 10)
+    defaults = BondHunterStrategy().default_config()
+    def cfg(key):
+        return config.get(key, defaults[key])
+
+    min_prob = cfg("min_probability")
+    max_prob = cfg("max_probability")
+    min_profit_net = cfg("min_profit_net")
+    max_hours = cfg("max_hours_to_close")
+    min_liquidity = cfg("min_liquidity_usdc")
+    fee_rate = cfg("fee_rate")
+    capital = cfg("initial_capital")
+    kelly_fraction = cfg("kelly_fraction")
+    max_position_pct = cfg("max_position_pct")
+    max_capital_deployed_pct = cfg("max_capital_deployed_pct")
+    min_unique_traders = cfg("min_unique_traders")
 
     import time as _time
     scan_start = _time.time()
@@ -533,9 +537,9 @@ def run_paper(conn: sqlite3.Connection, config: dict):
             skipped_wash += 1
             continue
 
-        # Minimum unique traders filter
+        # Minimum unique traders filter (only apply if data available)
         traders = int(m.get("uniqueTraderCount", 0) or m.get("unique_traders_count", 0) or 0)
-        if traders < min_unique_traders:
+        if traders > 0 and traders < min_unique_traders:
             skipped_quality += 1
             continue
 
