@@ -45,7 +45,7 @@ class BondHunterStrategy(BaseStrategy):
             "initial_capital": 500.0,
             "min_probability": 0.92,
             "max_probability": 0.995,
-            "min_profit_net": 0.015,        # 1.5% min edge (after fees) — need >94% WR
+            "min_profit_net": 0.025,        # 2.5% min edge (after fees) — skip marginal trades
             "max_hours_to_close": 168.0,     # up to 7 days
             "min_liquidity_usdc": 300.0,
             "kelly_fraction": 0.35,
@@ -328,11 +328,11 @@ def estimate_spread(liquidity: float) -> float:
 def kelly_size(capital: float, entry_price: float, ask_price: float,
                kelly_fraction: float, max_pct: float) -> float:
     """
-    Position sizing for Bond Hunter with confidence scaling.
+    Position sizing for Bond Hunter with profit-weighted scaling.
 
     Uses assumed win probability of 0.995 (Bond Hunter thesis: these markets
-    resolve YES with near certainty). Position scales up with market probability
-    — a market at 0.98 is more certain than 0.92, so deserves larger allocation.
+    resolve YES with near certainty). Position scales up with expected profit
+    — a trade at 0.93 (7% profit) deserves more capital than one at 0.96 (3%).
     """
     assumed_win_prob = 0.995
     b = (1.0 - ask_price) / ask_price  # payout odds
@@ -340,10 +340,14 @@ def kelly_size(capital: float, entry_price: float, ask_price: float,
     q = 1.0 - p
     kelly_f = max(0.0, (b * p - q) / b)
 
-    # Confidence scaling: higher entry_price = more certain = scale up
-    # At 0.92: multiplier ~0.7, at 0.97: ~1.0, at 0.99: ~1.1
-    confidence_mult = 0.5 + (entry_price - 0.90) * 5.0  # linear 0.6-1.0 range
-    confidence_mult = max(0.6, min(1.1, confidence_mult))
+    # Profit-weighted scaling: lower entry = higher profit = more capital
+    # net_profit ≈ (1 - ask_price) - fee, so scale by expected return
+    # At 0.93 (~6% profit): multiplier 1.3
+    # At 0.95 (~4% profit): multiplier 1.1
+    # At 0.96 (~3% profit): multiplier 1.0
+    # At 0.97 (~2% profit): multiplier 0.7
+    net_profit = 1.0 - ask_price
+    confidence_mult = min(1.4, max(0.6, net_profit * 20.0))  # 3%→0.6, 5%→1.0, 7%→1.4
 
     position = capital * kelly_fraction * kelly_f * confidence_mult
     position = min(position, capital * max_pct)
