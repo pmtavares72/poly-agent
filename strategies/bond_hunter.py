@@ -695,7 +695,20 @@ def run_live(conn: sqlite3.Connection, config: dict):
     Bond Hunter does NOT sell — when the market resolves YES, tokens
     automatically redeem at $1.00 on-chain (no exit order needed).
     """
-    from clob_client import place_limit_order
+    import logging
+    logger = logging.getLogger("bond_hunter.live")
+
+    # Validate CLOB client BEFORE scanning markets
+    try:
+        from clob_client import get_clob_client, place_limit_order
+        client = get_clob_client()
+        logger.info("CLOB client initialized OK")
+        console.print("[green]  ✓ CLOB client connected[/green]")
+    except Exception as e:
+        logger.error(f"CLOB client failed: {e}")
+        console.print(f"\n[red bold]⛔ Cannot connect to CLOB API: {e}[/red bold]")
+        console.print("[red]Check credentials in Settings page or environment variables.[/red]\n")
+        return
 
     defaults = BondHunterStrategy().default_config()
     def cfg(key):
@@ -896,6 +909,7 @@ def run_live(conn: sqlite3.Connection, config: dict):
             )
             order_id = response.get("orderID") or response.get("id") or "unknown"
         except Exception as e:
+            logger.error(f"Order failed: {question[:50]} | price={order_price} size={order_size} | {e}")
             console.print(f"  [red]✗ Order failed for {question[:40]}...: {e}[/red]")
             order_errors += 1
             continue
@@ -957,12 +971,20 @@ def run_live(conn: sqlite3.Connection, config: dict):
     ))
     conn.commit()
 
+    logger.info(
+        f"LIVE scan done: markets={len(markets)} analyzed={markets_checked} "
+        f"orders={new_signals} errors={order_errors} resolved={resolved_count}"
+    )
+
     console.print(f"\n[bold]Bond Hunter LIVE scan complete.[/bold]")
     console.print(f"  Markets downloaded:   [cyan]{len(markets)}[/cyan]")
     console.print(f"  Markets analyzed:     [cyan]{markets_checked}[/cyan]")
     console.print(f"  [bold green]Orders placed:       {new_signals}[/bold green]")
     console.print(f"  Signals resolved:     [green]{resolved_count}[/green]")
-    console.print(f"  Order errors:         [red]{order_errors}[/red]")
+    if order_errors > 0:
+        console.print(f"  [red bold]Order errors:         {order_errors} ← check logs/agent.log[/red bold]")
+    else:
+        console.print(f"  Order errors:         [dim]{order_errors}[/dim]")
     console.print(f"  Skipped (wash):       [dim]{skipped_wash}[/dim]")
     console.print(f"  Skipped (quality):    [dim]{skipped_quality}[/dim]")
     console.print(f"  Skipped (spread):     [dim]{skipped_spread}[/dim]")
