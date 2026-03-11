@@ -196,7 +196,9 @@ def init_db(db_path: str = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.d
             resolved_at         TEXT,
             pnl_usdc            REAL,
             pnl_pct             REAL,
-            status              TEXT DEFAULT 'open'  -- open | resolved | expired
+            status              TEXT DEFAULT 'open',  -- open | resolved | expired
+            mode                TEXT DEFAULT 'paper',  -- paper | live
+            order_id            TEXT                   -- CLOB order ID (live mode only)
         );
 
         -- Strategy registry (multi-strategy architecture)
@@ -265,12 +267,27 @@ def init_db(db_path: str = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.d
             status          TEXT DEFAULT 'open'
         );
 
+        -- Credentials store (Settings page — encrypted at rest)
+        CREATE TABLE IF NOT EXISTS credentials (
+            id              INTEGER PRIMARY KEY DEFAULT 1,
+            private_key     TEXT,
+            funder_address  TEXT,
+            signature_type  INTEGER DEFAULT 1,
+            api_key         TEXT,
+            api_secret      TEXT,
+            api_passphrase  TEXT,
+            updated_at      TEXT
+        );
+        INSERT OR IGNORE INTO credentials (id) VALUES (1);
+
     """)
     conn.commit()
 
     # Migraciones: añadir columnas nuevas a tablas existentes sin perder datos
     migrations = [
         ("config", "max_capital_deployed_pct", "REAL DEFAULT 0.50"),
+        ("signals", "mode", "TEXT DEFAULT 'paper'"),
+        ("signals", "order_id", "TEXT"),
     ]
     for table, column, definition in migrations:
         try:
@@ -1361,9 +1378,9 @@ def run_paper(params: dict):
 
 def parse_args() -> dict:
     parser = argparse.ArgumentParser(
-        description="Polymarket Bond Hunter — Backtesting & Paper Trading"
+        description="Polymarket Bond Hunter — Backtesting, Paper & Live Trading"
     )
-    parser.add_argument("--mode",      type=str,   default="backtest",         help="backtest | paper")
+    parser.add_argument("--mode",      type=str,   default="backtest",         help="backtest | paper | live")
     parser.add_argument("--days",      type=int,   default=DAYS_BACK,          help="Días hacia atrás (backtest)")
     parser.add_argument("--capital",   type=float, default=INITIAL_CAPITAL,    help="Capital inicial USDC")
     parser.add_argument("--min-prob",  type=float, default=MIN_PROBABILITY,    help="Prob. mínima YES")
@@ -1374,6 +1391,7 @@ def parse_args() -> dict:
     parser.add_argument("--fee-rate",  type=float, default=FEE_RATE,           help="Fee protocolo")
     parser.add_argument("--force",     action="store_true",                    help="Forzar ejecución aunque bot esté disabled")
     parser.add_argument("--strategy",  type=str,   default="bond_hunter",      help="Strategy slug (bond_hunter | ifnl_lite)")
+    parser.add_argument("--cancel-all", action="store_true",                   help="Cancel all open CLOB orders and exit")
     args = parser.parse_args()
 
     return {
@@ -1390,6 +1408,7 @@ def parse_args() -> dict:
         "kelly_fraction":   KELLY_FRACTION,
         "max_position_pct": MAX_POSITION_PCT,
         "force":            args.force,
+        "cancel_all":       args.cancel_all,
     }
 
 
@@ -1433,17 +1452,38 @@ def check_bot_enabled(conn: sqlite3.Connection) -> bool:
 
 if __name__ == "__main__":
     import os
+    from dotenv import load_dotenv
     from strategies import get_strategy
 
+    # Load .env file (for POLYMARKET_PRIVATE_KEY, etc.)
+    load_dotenv()
+
     cli_params = parse_args()
+
+    # --cancel-all: emergency kill switch
+    if cli_params.get("cancel_all"):
+        console.print("[bold red]Cancelling ALL open CLOB orders...[/bold red]")
+        try:
+            from clob_client import cancel_all_orders
+            result = cancel_all_orders()
+            console.print(f"[green]✓ All orders cancelled: {result}[/green]")
+        except Exception as e:
+            console.print(f"[red]✗ Cancel failed: {e}[/red]")
+        exit(0)
+
     mode = cli_params.get("mode", "backtest")
+
+    # Allow POLYAGENT_MODE env var to override default (but CLI --mode takes precedence)
+    if mode == "backtest" and os.environ.get("POLYAGENT_MODE") in ("paper", "live"):
+        mode = os.environ["POLYAGENT_MODE"]
+
     strategy_slug = cli_params.get("strategy", "bond_hunter")
 
     # Inicializar BD primero para tener acceso a config y bot_status
     conn_init = init_db()
     conn_init.row_factory = sqlite3.Row
 
-    if mode == "paper":
+    if mode in ("paper", "live"):
         # Verificar si el bot está habilitado (a menos que se fuerce con --force)
         if not check_bot_enabled(conn_init) and not cli_params.get("force"):
             console.print("[yellow]Bot está PARADO (disabled en config). "
@@ -1454,7 +1494,13 @@ if __name__ == "__main__":
         # Mezclar: CLI tiene precedencia sobre BD, BD tiene precedencia sobre defaults
         db_params = load_config_from_db(conn_init)
         params = {**db_params, **{k: v for k, v in cli_params.items() if k != "mode"}}
-        params["mode"] = "paper"
+        params["mode"] = mode
+
+        # For live mode, override capital from env if set
+        if mode == "live":
+            live_capital = os.environ.get("POLYAGENT_LIVE_CAPITAL")
+            if live_capital:
+                params["initial_capital"] = float(live_capital)
 
         # Registrar inicio de scan
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -1471,9 +1517,12 @@ if __name__ == "__main__":
             conn_init.close()
             exit(1)
 
-        console.rule(f"[bold green]POLYMARKET {strategy.name.upper()} — PAPER TRADING[/bold green]")
+        mode_label = "LIVE TRADING 💰" if mode == "live" else "PAPER TRADING"
+        color = "bold red" if mode == "live" else "bold green"
+        console.rule(f"[{color}]POLYMARKET {strategy.name.upper()} — {mode_label}[/{color}]")
         console.print(f"  Capital: [bold]${params['initial_capital']:.2f}[/bold]  |  "
-                      f"Strategy: [bold]{strategy.name}[/bold]\n")
+                      f"Strategy: [bold]{strategy.name}[/bold]  |  "
+                      f"Mode: [bold]{mode.upper()}[/bold]\n")
 
         try:
             strategy.run(conn_init, params)

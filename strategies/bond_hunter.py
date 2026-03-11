@@ -58,8 +58,12 @@ class BondHunterStrategy(BaseStrategy):
         }
 
     def run(self, conn: sqlite3.Connection, config: dict):
-        """Execute a paper trading scan."""
-        run_paper(conn, config)
+        """Execute a scan — paper or live depending on config['mode']."""
+        mode = config.get("mode", "paper")
+        if mode == "live":
+            run_live(conn, config)
+        else:
+            run_paper(conn, config)
 
     def resolve_signals(self, conn: sqlite3.Connection) -> int:
         return resolve_pending_signals(conn)
@@ -621,15 +625,17 @@ def run_paper(conn: sqlite3.Connection, config: dict):
                 detected_at, token_id, question, market_url, closes_at,
                 hours_to_close, entry_price, ask_price, spread_entry_pct,
                 net_profit_pct, position_usdc, shares, protocol_fee,
-                breakeven_price, liquidity, volume_24h, wash_score, status
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                breakeven_price, liquidity, volume_24h, wash_score, status,
+                mode
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).isoformat(),
             token_id_yes, question, market_url,
             end_date_str, hours_to_close,
             current_price, ask_price, spread,
             net_profit_pct, position_usdc, shares, protocol_fee,
-            breakeven, liquidity, volume_24h, "ok", "open"
+            breakeven, liquidity, volume_24h, "ok", "open",
+            "paper"
         ))
         conn.commit()
         new_signals += 1
@@ -674,4 +680,293 @@ def run_paper(conn: sqlite3.Connection, config: dict):
     console.print(f"  Skipped (spread):     [dim]{skipped_spread}[/dim]")
     console.print(f"  No CLOB data:         [dim]{skipped_no_data}[/dim]")
     console.print(f"  Price out of range:   [dim]{skipped_price}[/dim]")
+    console.print(f"  Duration:             [dim]{duration_sec}s[/dim]\n")
+
+
+# ─────────────────────────────────────────────
+# LIVE TRADING SCAN
+# ─────────────────────────────────────────────
+
+def run_live(conn: sqlite3.Connection, config: dict):
+    """
+    Live trading mode: same logic as run_paper() but places real limit orders
+    on Polymarket via py-clob-client. Uses GTC limit BUY orders only.
+
+    Bond Hunter does NOT sell — when the market resolves YES, tokens
+    automatically redeem at $1.00 on-chain (no exit order needed).
+    """
+    from clob_client import place_limit_order
+
+    defaults = BondHunterStrategy().default_config()
+    def cfg(key):
+        return config.get(key, defaults[key])
+
+    min_prob = cfg("min_probability")
+    max_prob = cfg("max_probability")
+    min_profit_net = cfg("min_profit_net")
+    max_hours = cfg("max_hours_to_close")
+    min_liquidity = cfg("min_liquidity_usdc")
+    fee_rate = cfg("fee_rate")
+    capital = cfg("initial_capital")
+    kelly_fraction = cfg("kelly_fraction")
+    max_position_pct = cfg("max_position_pct")
+    max_capital_deployed_pct = cfg("max_capital_deployed_pct")
+    min_unique_traders = cfg("min_unique_traders")
+
+    # Safety rails from env
+    import os
+    daily_loss_limit = float(os.environ.get("POLYAGENT_DAILY_LOSS_LIMIT", "-50.0"))
+
+    import time as _time
+    scan_start = _time.time()
+
+    # Insert scan_log entry
+    scan_started_at = datetime.now(timezone.utc).isoformat()
+    cur_log = conn.cursor()
+    cur_log.execute(
+        "INSERT INTO scan_log (started_at, mode) VALUES (?, 'live')",
+        (scan_started_at,)
+    )
+    conn.commit()
+    scan_log_id = cur_log.lastrowid
+
+    # Resolve pending signals first (same as paper — checks market resolution)
+    resolved_count = resolve_pending_signals(conn)
+
+    # Check daily P&L — stop if below limit
+    cur_pnl = conn.cursor()
+    cur_pnl.execute("""
+        SELECT COALESCE(SUM(pnl_usdc), 0) FROM signals
+        WHERE mode='live' AND status='resolved'
+        AND resolved_at >= date('now', 'start of day')
+    """)
+    daily_pnl = cur_pnl.fetchone()[0]
+    if daily_pnl <= daily_loss_limit:
+        console.print(
+            f"\n[red bold]⛔ Daily loss limit reached: ${daily_pnl:.2f} "
+            f"(limit: ${daily_loss_limit:.2f}). No new orders.[/red bold]\n"
+        )
+        return
+
+    # Check available capital (only count live open positions)
+    cur_cap = conn.cursor()
+    cur_cap.execute("SELECT COALESCE(SUM(position_usdc),0), COUNT(*) FROM signals WHERE status='open' AND mode='live'")
+    committed_usdc, open_count = cur_cap.fetchone()
+    max_deployable = capital * max_capital_deployed_pct
+    available_capital = max(0.0, max_deployable - committed_usdc)
+    deployed_pct = (committed_usdc / capital * 100) if capital > 0 else 0
+
+    # Cooldown: skip markets where we recently lost
+    cur_cap.execute("""
+        SELECT token_id FROM signals
+        WHERE outcome='NO' AND resolved_at > datetime('now', '-24 hours')
+    """)
+    recent_loss_tokens = {row[0] for row in cur_cap.fetchall()}
+
+    if committed_usdc >= max_deployable:
+        console.print(
+            f"\n[yellow]⚠ Capital deployed ${committed_usdc:.2f} "
+            f"({deployed_pct:.0f}%) ≥ limit {max_capital_deployed_pct*100:.0f}% "
+            f"of capital. No new orders.[/yellow]\n"
+        )
+        markets = []
+    else:
+        console.print(f"\n[cyan]Scanning open markets for Bond Hunter [bold]LIVE[/bold] signals...[/cyan]\n")
+        console.print(
+            f"[cyan]  Capital: ${capital:.2f} · Deployed: ${committed_usdc:.2f} "
+            f"({deployed_pct:.0f}%) · Available: ${available_capital:.2f} "
+            f"(limit {max_capital_deployed_pct*100:.0f}%) · Daily P&L: ${daily_pnl:.2f}[/cyan]\n"
+        )
+        markets = fetch_open_markets(min_liquidity)
+        console.print(f"[cyan]  {len(markets)} active markets found[/cyan]\n")
+
+    new_signals = 0
+    markets_checked = 0
+    skipped_wash = 0
+    skipped_spread = 0
+    skipped_no_data = 0
+    skipped_price = 0
+    skipped_quality = 0
+    order_errors = 0
+
+    for m in markets:
+        question = m.get("question", m.get("title", "Unknown"))
+
+        ok, token_or_reason, _ = passes_basic_filters(m, min_liquidity, require_resolved=False)
+        if not ok:
+            continue
+
+        token_id_yes = token_or_reason
+        markets_checked += 1
+
+        # Skip markets where we recently lost
+        if token_id_yes in recent_loss_tokens:
+            continue
+
+        is_wash, _ = compute_wash_score(m)
+        if is_wash:
+            skipped_wash += 1
+            continue
+
+        # Minimum unique traders filter
+        traders = int(m.get("uniqueTraderCount", 0) or m.get("unique_traders_count", 0) or 0)
+        if traders > 0 and traders < min_unique_traders:
+            skipped_quality += 1
+            continue
+
+        end_date_str = m.get("endDate") or m.get("endDateIso") or ""
+        try:
+            end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+            end_ts = int(end_dt.timestamp())
+        except ValueError:
+            continue
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        hours_to_close = (end_ts - now_ts) / 3600.0
+        if hours_to_close <= 0 or hours_to_close > max_hours:
+            continue
+
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+        start_ts = now_ts - 600
+        history = fetch_price_series(token_id_yes, start_ts, now_ts)
+        if not history:
+            skipped_no_data += 1
+            continue
+
+        try:
+            current_price = float(history[-1]["p"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if not (min_prob <= current_price <= max_prob):
+            skipped_price += 1
+            continue
+
+        # Price stability check
+        if len(history) >= 2:
+            oldest_price = float(history[0]["p"])
+            if oldest_price > 0 and (current_price - oldest_price) / oldest_price < -0.03:
+                skipped_quality += 1
+                continue
+
+        # Check no existing open position for this token
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM signals WHERE token_id=? AND status='open'", (token_id_yes,))
+        if cur.fetchone():
+            continue
+
+        if available_capital < 5.0:
+            break
+
+        liquidity_raw = m.get("liquidity")
+        liquidity = float(liquidity_raw or 0) if liquidity_raw is not None else None
+        if liquidity is None:
+            market_spread = float(m.get("spread") or 0.02)
+            liquidity = 10000.0 if market_spread < 0.005 else (2000.0 if market_spread < 0.01 else 800.0)
+
+        spread = estimate_spread(liquidity)
+        ask_price = min(current_price + spread / 2, 0.999)
+        net_profit_pct = (1.0 - ask_price) - fee_rate
+
+        if net_profit_pct < min_profit_net:
+            skipped_spread += 1
+            continue
+
+        if available_capital < 5.0:
+            break
+        position_usdc = kelly_size(capital, current_price, ask_price, kelly_fraction, max_position_pct)
+        position_usdc = min(position_usdc, available_capital)
+        shares = position_usdc / ask_price
+        protocol_fee = position_usdc * fee_rate
+        breakeven = ask_price + fee_rate
+
+        # ── PLACE REAL ORDER ──────────────────────
+        # Round price to 2 decimal places (CLOB requirement for prices near 1.0)
+        order_price = round(ask_price, 2)
+        order_size = round(shares, 2)
+
+        if order_size < 1.0:
+            continue  # Too small to place
+
+        try:
+            response = place_limit_order(
+                token_id=token_id_yes,
+                price=order_price,
+                size=order_size,
+            )
+            order_id = response.get("orderID") or response.get("id") or "unknown"
+        except Exception as e:
+            console.print(f"  [red]✗ Order failed for {question[:40]}...: {e}[/red]")
+            order_errors += 1
+            continue
+
+        # Order placed successfully — record in DB
+        available_capital -= position_usdc
+
+        volume_24h = float(m.get("volume24hr") or 0)
+        market_url = f"https://polymarket.com/event/{m.get('slug', '')}"
+
+        cur.execute("""
+            INSERT INTO signals (
+                detected_at, token_id, question, market_url, closes_at,
+                hours_to_close, entry_price, ask_price, spread_entry_pct,
+                net_profit_pct, position_usdc, shares, protocol_fee,
+                breakeven_price, liquidity, volume_24h, wash_score, status,
+                mode, order_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            datetime.now(timezone.utc).isoformat(),
+            token_id_yes, question, market_url,
+            end_date_str, hours_to_close,
+            current_price, order_price, spread,
+            net_profit_pct, position_usdc, order_size, protocol_fee,
+            breakeven, liquidity, volume_24h, "ok", "open",
+            "live", str(order_id),
+        ))
+        conn.commit()
+        new_signals += 1
+
+        q_short = (question[:52] + "…") if len(question) > 52 else question.ljust(53)
+        console.print(
+            f"  🎯  [bold]{q_short}[/bold]  "
+            f"[cyan]${order_price:.4f}[/cyan]  "
+            f"[yellow]${position_usdc:.2f}[/yellow]  "
+            f"closes in [white]{hours_to_close:.1f}h[/white]  "
+            f"net=[green]+{net_profit_pct*100:.2f}%[/green]  "
+            f"[bold magenta]ORDER={order_id}[/bold magenta]"
+        )
+
+    # Update scan_log
+    finished_at = datetime.now(timezone.utc).isoformat()
+    duration_sec = round(_time.time() - scan_start, 1)
+    conn.execute("""
+        UPDATE scan_log SET
+            finished_at=?, duration_sec=?,
+            markets_fetched=?, markets_checked=?,
+            signals_found=?, signals_resolved=?,
+            skipped_wash=?, skipped_spread=?,
+            skipped_no_data=?, skipped_price=?
+        WHERE id=?
+    """, (
+        finished_at, duration_sec,
+        len(markets), markets_checked,
+        new_signals, resolved_count,
+        skipped_wash, skipped_spread,
+        skipped_no_data, skipped_price,
+        scan_log_id,
+    ))
+    conn.commit()
+
+    console.print(f"\n[bold]Bond Hunter LIVE scan complete.[/bold]")
+    console.print(f"  Markets downloaded:   [cyan]{len(markets)}[/cyan]")
+    console.print(f"  Markets analyzed:     [cyan]{markets_checked}[/cyan]")
+    console.print(f"  [bold green]Orders placed:       {new_signals}[/bold green]")
+    console.print(f"  Signals resolved:     [green]{resolved_count}[/green]")
+    console.print(f"  Order errors:         [red]{order_errors}[/red]")
+    console.print(f"  Skipped (wash):       [dim]{skipped_wash}[/dim]")
+    console.print(f"  Skipped (quality):    [dim]{skipped_quality}[/dim]")
+    console.print(f"  Skipped (spread):     [dim]{skipped_spread}[/dim]")
+    console.print(f"  No CLOB data:         [dim]{skipped_no_data}[/dim]")
+    console.print(f"  Price out of range:   [dim]{skipped_price}[/dim]")
+    console.print(f"  Daily P&L:            [dim]${daily_pnl:.2f}[/dim]")
     console.print(f"  Duration:             [dim]{duration_sec}s[/dim]\n")

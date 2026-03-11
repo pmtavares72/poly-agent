@@ -8,7 +8,7 @@ import { Topbar } from './Topbar'
 import { TickerTape } from './TickerTape'
 import { timeAgo } from '@/lib/format'
 
-type Page = 'dashboard' | 'strategies' | 'logs'
+type Page = 'dashboard' | 'strategies' | 'logs' | 'settings'
 
 interface AppShellProps {
   children: React.ReactNode

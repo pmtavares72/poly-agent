@@ -97,3 +97,29 @@ ALTER TABLE config ADD COLUMN stop_loss_pct REAL DEFAULT 0.15;
 
 -- Update existing rows to have the default value
 UPDATE config SET stop_loss_pct = 0.15 WHERE stop_loss_pct IS NULL;
+
+-- ===========================================
+-- Migration 004: Live trading support
+-- Added: mode + order_id columns to signals
+-- ===========================================
+-- Add mode column to differentiate paper vs live signals
+-- Add order_id to track CLOB order IDs for live trades
+-- ALTER TABLE will fail silently if columns already exist (handled by start.sh)
+ALTER TABLE signals ADD COLUMN mode TEXT DEFAULT 'paper';
+ALTER TABLE signals ADD COLUMN order_id TEXT;
+
+-- ===========================================
+-- Migration 005: Credentials store
+-- Added: Settings page for private key + auto-derived funder/API creds
+-- ===========================================
+CREATE TABLE IF NOT EXISTS credentials (
+    id              INTEGER PRIMARY KEY DEFAULT 1,
+    private_key     TEXT,
+    funder_address  TEXT,
+    signature_type  INTEGER DEFAULT 1,
+    api_key         TEXT,
+    api_secret      TEXT,
+    api_passphrase  TEXT,
+    updated_at      TEXT
+);
+INSERT OR IGNORE INTO credentials (id) VALUES (1);

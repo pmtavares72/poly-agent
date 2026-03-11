@@ -6,3 +6,6 @@ uvicorn[standard]
 pydantic
 websockets
 aiohttp
+py-clob-client
+python-dotenv
+eth-account

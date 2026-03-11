@@ -19,14 +19,18 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from strategies import get_strategy, STRATEGY_REGISTRY
 
+load_dotenv()
+
 DB_PATH = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.db")
 AGENT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.py")
+TRADING_MODE = os.environ.get("POLYAGENT_MODE", "paper")  # "paper" or "live"
 
 # Track running continuous strategy processes {slug: subprocess.Popen}
 _running_processes: dict[str, subprocess.Popen] = {}
@@ -83,7 +87,26 @@ class ConfigUpdate(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "db": DB_PATH, "ts": datetime.now(timezone.utc).isoformat()}
+    return {"ok": True, "db": DB_PATH, "mode": TRADING_MODE, "ts": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/trading-mode")
+def get_trading_mode():
+    """Returns the current trading mode (paper or live)."""
+    return {"mode": TRADING_MODE}
+
+
+@app.post("/orders/cancel-all")
+def api_cancel_all_orders():
+    """Emergency: cancel all open CLOB orders. Only works in live mode."""
+    if TRADING_MODE != "live":
+        raise HTTPException(status_code=400, detail="Not in live mode — no real orders to cancel")
+    try:
+        from clob_client import cancel_all_orders
+        result = cancel_all_orders()
+        return {"cancelled": True, "result": str(result)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cancel failed: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -195,7 +218,7 @@ def scan_now():
 
     try:
         proc = subprocess.Popen(
-            [sys.executable, AGENT_SCRIPT, "--mode", "paper", "--force"],
+            [sys.executable, AGENT_SCRIPT, "--mode", TRADING_MODE, "--force"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -203,7 +226,8 @@ def scan_now():
         return {
             "triggered": True,
             "pid": proc.pid,
-            "message": f"Scan launched (pid={proc.pid}). Results appear in ~2-5 min.",
+            "mode": TRADING_MODE,
+            "message": f"Scan launched in {TRADING_MODE} mode (pid={proc.pid}). Results appear in ~2-5 min.",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to launch agent: {e}")
@@ -515,13 +539,13 @@ def strategy_scan_now(slug: str):
 
     try:
         proc = subprocess.Popen(
-            [sys.executable, AGENT_SCRIPT, "--mode", "paper", "--strategy", slug, "--force"],
+            [sys.executable, AGENT_SCRIPT, "--mode", TRADING_MODE, "--strategy", slug, "--force"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        return {"triggered": True, "pid": proc.pid, "strategy": slug,
-                "message": f"Scan launched (pid={proc.pid})"}
+        return {"triggered": True, "pid": proc.pid, "strategy": slug, "mode": TRADING_MODE,
+                "message": f"Scan launched in {TRADING_MODE} mode (pid={proc.pid})"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to launch scan: {e}")
 
@@ -667,3 +691,265 @@ def get_run_trades(
     total = cur.fetchone()[0]
     conn.close()
     return {"run_id": run_id, "total": total, "data": data}
+
+
+# ─────────────────────────────────────────────
+# SETTINGS / CREDENTIALS
+# ─────────────────────────────────────────────
+
+# Polymarket CREATE2 constants for proxy wallet derivation
+PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
+PROXY_INIT_CODE_HASH = bytes.fromhex(
+    "d21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b"
+)
+
+
+def _keccak256(data: bytes) -> bytes:
+    """Keccak-256 hash using pysha3 or hashlib (Python 3.11+)."""
+    try:
+        import sha3
+        k = sha3.keccak_256()
+        k.update(data)
+        return k.digest()
+    except ImportError:
+        import hashlib
+        return hashlib.sha3_256(data).digest()  # fallback, NOT keccak — see below
+
+
+def derive_funder_address(private_key: str) -> str:
+    """
+    Derive Polymarket proxy wallet (funder address) from private key using CREATE2.
+    Formula: address = last20bytes(keccak256(0xff ++ factory ++ salt ++ initCodeHash))
+    where salt = keccak256(abi.encodePacked(eoaAddress))
+    """
+    try:
+        from eth_account import Account
+        from eth_utils import keccak as eth_keccak
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="eth-account not installed. Run: pip install eth-account"
+        )
+
+    # Ensure 0x prefix
+    if not private_key.startswith("0x"):
+        private_key = "0x" + private_key
+
+    # Derive EOA address from private key
+    account = Account.from_key(private_key)
+    eoa_address = account.address.lower()
+
+    # salt = keccak256(abi.encodePacked(eoaAddress))
+    eoa_bytes = bytes.fromhex(eoa_address[2:])  # remove 0x
+    salt = eth_keccak(eoa_bytes)
+
+    # CREATE2: keccak256(0xff ++ factory ++ salt ++ initCodeHash)
+    factory_bytes = bytes.fromhex(PROXY_FACTORY[2:].lower())
+    create2_input = b'\xff' + factory_bytes + salt + PROXY_INIT_CODE_HASH
+    address_hash = eth_keccak(create2_input)
+
+    # Take last 20 bytes as the address
+    proxy_address = "0x" + address_hash[-20:].hex()
+    return proxy_address
+
+
+def derive_api_creds(private_key: str, funder_address: str, signature_type: int) -> dict:
+    """Derive API credentials from private key using py-clob-client."""
+    try:
+        from py_clob_client.client import ClobClient
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="py-clob-client not installed. Run: pip install py-clob-client"
+        )
+
+    host = os.environ.get("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")
+    chain_id = int(os.environ.get("POLYMARKET_CHAIN_ID", "137"))
+
+    client = ClobClient(
+        host,
+        key=private_key if private_key.startswith("0x") else "0x" + private_key,
+        chain_id=chain_id,
+        signature_type=signature_type,
+        funder=funder_address,
+    )
+    creds = client.create_or_derive_api_creds()
+    return {
+        "api_key": creds.api_key,
+        "api_secret": creds.api_secret,
+        "api_passphrase": creds.api_passphrase,
+    }
+
+
+class CredentialsUpdate(BaseModel):
+    private_key: Optional[str] = None
+    funder_address: Optional[str] = None
+    signature_type: Optional[int] = None
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
+    api_passphrase: Optional[str] = None
+
+
+@app.get("/settings/credentials")
+def get_credentials():
+    """Get stored credentials (private key is masked)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM credentials WHERE id=1")
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"configured": False}
+
+    creds = dict(row)
+    pk = creds.get("private_key") or ""
+    has_pk = bool(pk and len(pk) >= 10)
+
+    return {
+        "configured": has_pk,
+        "private_key_masked": f"{pk[:6]}...{pk[-4:]}" if has_pk else "",
+        "funder_address": creds.get("funder_address") or "",
+        "signature_type": creds.get("signature_type", 1),
+        "has_api_creds": bool(creds.get("api_key")),
+        "updated_at": creds.get("updated_at"),
+    }
+
+
+@app.post("/settings/credentials")
+def save_credentials(creds: CredentialsUpdate):
+    """
+    Save credentials. If private_key is provided, auto-derives:
+    1. Funder address (CREATE2 proxy wallet)
+    2. API credentials (via CLOB API)
+    """
+    conn = get_conn()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Load existing credentials
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM credentials WHERE id=1")
+    row = cur.fetchone()
+    existing = dict(row) if row else {}
+
+    pk = creds.private_key or existing.get("private_key") or ""
+    sig_type = creds.signature_type if creds.signature_type is not None else existing.get("signature_type", 1)
+    funder = creds.funder_address or existing.get("funder_address") or ""
+    api_key = creds.api_key or existing.get("api_key") or ""
+    api_secret = creds.api_secret or existing.get("api_secret") or ""
+    api_passphrase = creds.api_passphrase or existing.get("api_passphrase") or ""
+
+    errors = []
+
+    # Auto-derive funder address from private key
+    if creds.private_key and not creds.funder_address:
+        try:
+            funder = derive_funder_address(pk)
+        except Exception as e:
+            errors.append(f"Could not derive funder address: {e}")
+
+    # Auto-derive API credentials
+    if creds.private_key and funder:
+        try:
+            api = derive_api_creds(pk, funder, sig_type)
+            api_key = api["api_key"]
+            api_secret = api["api_secret"]
+            api_passphrase = api["api_passphrase"]
+        except Exception as e:
+            errors.append(f"Could not derive API credentials: {e}")
+
+    # Save to DB
+    conn.execute("""
+        INSERT OR REPLACE INTO credentials
+        (id, private_key, funder_address, signature_type, api_key, api_secret, api_passphrase, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+    """, (pk, funder, sig_type, api_key, api_secret, api_passphrase, now_iso))
+    conn.commit()
+
+    # Also update environment variables for current process
+    if pk:
+        os.environ["POLYMARKET_PRIVATE_KEY"] = pk
+    if funder:
+        os.environ["POLYMARKET_FUNDER_ADDRESS"] = funder
+    if api_key:
+        os.environ["POLYMARKET_API_KEY"] = api_key
+        os.environ["POLYMARKET_API_SECRET"] = api_secret
+        os.environ["POLYMARKET_API_PASSPHRASE"] = api_passphrase
+    os.environ["POLYMARKET_SIGNATURE_TYPE"] = str(sig_type)
+
+    # Reset CLOB client singleton so it picks up new creds
+    try:
+        import clob_client
+        clob_client._client = None
+    except (ImportError, AttributeError):
+        pass
+
+    conn.close()
+
+    has_pk = bool(pk and len(pk) >= 10)
+    return {
+        "saved": True,
+        "configured": has_pk,
+        "private_key_masked": f"{pk[:6]}...{pk[-4:]}" if has_pk else "",
+        "funder_address": funder,
+        "signature_type": sig_type,
+        "has_api_creds": bool(api_key),
+        "errors": errors if errors else None,
+        "updated_at": now_iso,
+    }
+
+
+@app.post("/settings/credentials/test")
+def test_credentials():
+    """Test CLOB API connection with stored credentials."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM credentials WHERE id=1")
+    row = cur.fetchone()
+    conn.close()
+
+    if not row or not row["private_key"]:
+        raise HTTPException(status_code=400, detail="No credentials configured")
+
+    pk = row["private_key"]
+    funder = row["funder_address"] or ""
+    sig_type = row["signature_type"] or 1
+
+    if not funder:
+        raise HTTPException(status_code=400, detail="No funder address — save credentials first")
+
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds
+
+        host = os.environ.get("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")
+        chain_id = int(os.environ.get("POLYMARKET_CHAIN_ID", "137"))
+
+        client = ClobClient(
+            host,
+            key=pk if pk.startswith("0x") else "0x" + pk,
+            chain_id=chain_id,
+            signature_type=sig_type,
+            funder=funder,
+        )
+
+        # Use stored API creds if available
+        api_key = row["api_key"] or ""
+        if api_key:
+            client.set_api_creds(ApiCreds(
+                api_key=api_key,
+                api_secret=row["api_secret"] or "",
+                api_passphrase=row["api_passphrase"] or "",
+            ))
+        else:
+            creds = client.create_or_derive_api_creds()
+            client.set_api_creds(creds)
+
+        # Test authenticated request
+        orders = client.get_orders()
+        return {
+            "success": True,
+            "message": "CLOB API connection successful",
+            "open_orders": len(orders) if isinstance(orders, list) else 0,
+        }
+    except Exception as e:
+        return {"success": False, "message": str(e)}

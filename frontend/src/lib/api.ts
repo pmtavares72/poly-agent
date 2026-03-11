@@ -1,4 +1,4 @@
-import type { Stats, SignalsResponse, Signal, Run, BotConfig, BotStatus, ScanLogsResponse, StrategiesResponse, Strategy } from '@/types'
+import type { Stats, SignalsResponse, Signal, Run, BotConfig, BotStatus, ScanLogsResponse, StrategiesResponse, Strategy, Credentials, CredentialsSaveResponse, CredentialsTestResponse } from '@/types'
 
 const BASE = '/api'
 
@@ -75,4 +75,11 @@ export const fetchStrategySignals  = (slug: string, params?: { status?: string; 
 }
 export const fetchStrategyStats    = (slug: string) => get<Record<string, unknown>>(`/strategies/${slug}/stats`)
 export const fetchStrategyActivity = (slug: string) => get<Record<string, unknown>>(`/strategies/${slug}/activity`)
+
+// Credentials / Settings
+export const fetchCredentials     = () => get<Credentials>('/settings/credentials')
+export const saveCredentials      = (data: { private_key?: string; signature_type?: number }) =>
+  post<CredentialsSaveResponse>('/settings/credentials', data)
+export const testCredentials      = () => post<CredentialsTestResponse>('/settings/credentials/test')
+export const fetchTradingMode     = () => get<{ mode: string }>('/trading-mode')
 

@@ -150,6 +150,32 @@ export interface IfnlSignal {
   status: 'open' | 'resolved' | 'expired'
 }
 
+export interface Credentials {
+  configured: boolean
+  private_key_masked: string
+  funder_address: string
+  signature_type: number
+  has_api_creds: boolean
+  updated_at: string | null
+}
+
+export interface CredentialsSaveResponse {
+  saved: boolean
+  configured: boolean
+  private_key_masked: string
+  funder_address: string
+  signature_type: number
+  has_api_creds: boolean
+  errors: string[] | null
+  updated_at: string
+}
+
+export interface CredentialsTestResponse {
+  success: boolean
+  message: string
+  open_orders?: number
+}
+
 export interface Run {
   id: number
   started_at: string

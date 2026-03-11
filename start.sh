@@ -10,14 +10,25 @@ cd "$SCRIPT_DIR"
 LOG_DIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
+# Load .env if present (contains POLYMARKET credentials + POLYAGENT_MODE)
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  set -a
+  source "$SCRIPT_DIR/.env"
+  set +a
+fi
+
 # Directorio de datos persistente (volumen Docker en OpenClaw, local fallback)
 DATA_DIR="${POLYAGENT_DATA_DIR:-$SCRIPT_DIR/data}"
 mkdir -p "$DATA_DIR"
 export POLYAGENT_DB="$DATA_DIR/polyagent.db"
 
+# Trading mode (paper or live) — read from .env or default to paper
+TRADING_MODE="${POLYAGENT_MODE:-paper}"
+
 echo "======================================"
 echo "  PolyAgent — Starting up"
 echo "  $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "  Mode: $(echo "$TRADING_MODE" | tr '[:lower:]' '[:upper:]')"
 echo "======================================"
 
 # ── 1. Dependencias Python ──────────────────
@@ -80,8 +91,9 @@ echo "        App: http://${SERVER_IP}:3000"
 
 # ── 5. Configurar cron ─────────────────────
 echo ""
-echo "[5/6] Configuring cron job (every 15 min)..."
-CRON_CMD="*/15 * * * * cd $SCRIPT_DIR && $PYTHON_BIN $SCRIPT_DIR/agent.py --mode paper >> $LOG_DIR/agent.log 2>&1"
+echo "[5/6] Configuring cron job (every 15 min, mode=$TRADING_MODE)..."
+# Source .env in cron so CLOB credentials are available in live mode
+CRON_CMD="*/15 * * * * cd $SCRIPT_DIR && set -a && [ -f $SCRIPT_DIR/.env ] && . $SCRIPT_DIR/.env; set +a && $PYTHON_BIN $SCRIPT_DIR/agent.py --mode $TRADING_MODE >> $LOG_DIR/agent.log 2>&1"
 
 # Añadir solo si no existe ya
 ( crontab -l 2>/dev/null | grep -v "agent.py"; echo "$CRON_CMD" ) | crontab -
@@ -129,6 +141,11 @@ fi
 echo ""
 echo "======================================"
 echo "  ✓ PolyAgent running!"
+echo "  Mode: $(echo "$TRADING_MODE" | tr '[:lower:]' '[:upper:]')"
+if [ "$TRADING_MODE" = "live" ]; then
+echo "  ⚠  LIVE TRADING — Real money at risk!"
+echo "  Capital: \$${POLYAGENT_LIVE_CAPITAL:-500.00}"
+fi
 echo ""
 echo "  App:     http://${SERVER_IP}:3000"
 echo "  API:     http://${SERVER_IP}:8765"

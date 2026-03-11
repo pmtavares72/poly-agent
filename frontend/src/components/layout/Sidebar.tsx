@@ -2,7 +2,7 @@
 import Link from 'next/link'
 import { LogoMark } from '@/components/ui/LogoMark'
 
-type Page = 'dashboard' | 'strategies' | 'logs'
+type Page = 'dashboard' | 'strategies' | 'logs' | 'settings'
 
 interface SidebarProps {
   activePage: Page
@@ -15,7 +15,7 @@ const navItems = [
   { id: 'signals',     href: '/dashboard#signals', icon: '◎', label: 'Signals',       section: 'monitor', badge: true },
   { id: 'history',     href: '/dashboard#history', icon: '≡', label: 'Trade History', section: 'monitor' },
   { id: 'logs',        href: '/logs',         icon: '▤', label: 'Scan Logs',     section: 'system' },
-  { id: 'settings',    href: '/strategies',  icon: '⚙', label: 'Settings',      section: 'system' },
+  { id: 'settings',    href: '/settings',    icon: '⚙', label: 'Settings',      section: 'system' },
 ]
 
 export function Sidebar({ activePage, openSignals = 0 }: SidebarProps) {

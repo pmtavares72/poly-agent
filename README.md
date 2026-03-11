@@ -1,103 +1,487 @@
 # PolyAgent
 
-Sistema de paper trading automatizado sobre mercados de predicción de Polymarket con arquitectura multi-estrategia.
+Bot de trading automatizado para mercados de predicción de Polymarket. Arquitectura multi-estrategia con soporte para **paper trading** (simulado) y **live trading** (órdenes reales con dinero real).
+
+---
+
+## Tabla de Contenidos
+
+1. [Overview](#overview)
+2. [Estrategias](#estrategias)
+3. [Quick Start (Paper Mode)](#quick-start-paper-mode)
+4. [Configuración de Trading Real (LIVE)](#configuración-de-trading-real-live)
+   - [Requisitos Previos](#requisitos-previos)
+   - [Paso 1: Exportar tu Private Key de Polymarket](#paso-1-exportar-tu-private-key-de-polymarket)
+   - [Paso 2: Encontrar tu Proxy Wallet (Funder Address)](#paso-2-encontrar-tu-proxy-wallet-funder-address)
+   - [Paso 3: Determinar tu Signature Type](#paso-3-determinar-tu-signature-type)
+   - [Paso 4: Configurar Variables de Entorno](#paso-4-configurar-variables-de-entorno)
+   - [Paso 5: Aprobar Token Allowances (Solo MetaMask/EOA)](#paso-5-aprobar-token-allowances-solo-metamaskeoa)
+   - [Paso 6: Generar API Credentials](#paso-6-generar-api-credentials)
+   - [Paso 7: Verificar Configuración](#paso-7-verificar-configuración)
+   - [Paso 8: Arrancar en Modo Live](#paso-8-arrancar-en-modo-live)
+5. [Variables de Entorno — Referencia Completa](#variables-de-entorno--referencia-completa)
+6. [Safety Rails (Protecciones)](#safety-rails-protecciones)
+7. [Cómo Funciona el Trading Real (Bond Hunter)](#cómo-funciona-el-trading-real-bond-hunter)
+8. [Arquitectura del Proyecto](#arquitectura-del-proyecto)
+9. [Base de Datos](#base-de-datos)
+10. [API Endpoints](#api-endpoints)
+11. [Dashboard](#dashboard)
+12. [Despliegue en OpenClaw](#despliegue-en-openclaw)
+13. [Troubleshooting](#troubleshooting)
+14. [Comandos Útiles](#comandos-útiles)
+15. [Seguridad](#seguridad)
+
+---
+
+## Overview
+
+| Característica | Paper Mode | Live Mode |
+|---------------|-----------|-----------|
+| Datos de mercado | Reales (Gamma API, CLOB, WebSocket) | Reales |
+| Ejecución de órdenes | Fills simulados | Órdenes limit reales via `py-clob-client` |
+| Capital en riesgo | $0 | Tu cantidad configurada |
+| Dashboard | Stats completos | Stats completos + order IDs reales |
+| Resolución de exits | Sintética (al resolver mercado) | Tokens se redimen automáticamente a $1.00 |
+
+**El modo por defecto es `paper`.** Tienes que activar `live` explícitamente en el `.env`.
 
 ---
 
 ## Estrategias
 
-### Bond Hunter (cron)
-Compra tokens YES en mercados binarios que cotizan entre 0.95–0.995 (eventos casi seguros), espera resolución (~48h) y cobra $1.00 por token. Ejecuta un scan cada 15 minutos vía cron.
+### Bond Hunter (Recomendada para Live)
 
-### IFNL-Lite (continuous)
-Detecta divergencia entre el flujo de trading informado y el movimiento de precio usando datos en tiempo real de WebSocket + perfilado de wallets offline. Posiciones de 5–20 minutos. Proceso persistente en background.
+- **Tipo:** Cron (se ejecuta cada 15 minutos)
+- **Lógica:** Compra tokens YES en mercados que cotizan entre $0.92–$0.995 (eventos casi seguros). Espera a que el mercado resuelva YES y cobra $1.00 por token.
+- **Edge:** Retornos pequeños pero consistentes (2.5%–8% por trade) con win rate >95%.
+- **Riesgo:** Se pierde toda la posición si el mercado resuelve NO. La protección viene de filtros estrictos de selección.
+- **Capital asignado:** $500 (configurable)
 
----
+### IFNL-Lite (Solo Paper por ahora)
 
-## Arquitectura
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          OpenClaw Server                             │
-│                                                                      │
-│   cron (*/15 * * * *)                                                │
-│       └─> python agent.py --mode paper                               │
-│               ├─> Resuelve señales anteriores pendientes             │
-│               ├─> Escanea mercados abiertos en Polymarket            │
-│               ├─> Detecta señales Bond Hunter                        │
-│               └─> Escribe en polyagent.db (SQLite)                   │
-│                            │                                         │
-│   ifnl_runner.py (proceso persistente, solo si enabled)              │
-│       ├─> WebSocket: book/trades en tiempo real                      │
-│       ├─> REST poller: trades con wallet IDs (~15s)                  │
-│       ├─> Signal engine: divergencia IFS vs precio                   │
-│       └─> Execution: paper positions con TP/SL/time stops            │
-│                            │                                         │
-│   uvicorn api:app :8765    │                                         │
-│       ├─> Lee polyagent.db ┘                                         │
-│       ├─> Expone REST API                                            │
-│       ├─> Controla Bond Hunter (enable/disable/scan-now)             │
-│       └─> Controla IFNL-Lite (enable → spawn, disable → kill)       │
-│                                                                      │
-│   next start :3000                                                   │
-│       ├─> Proxy /api/* → localhost:8765                               │
-│       ├─> Dashboard con tabs por estrategia                          │
-│       └─> Start/Stop para cada estrategia independiente              │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
-```
+- **Tipo:** Continuo (WebSocket + polling)
+- **Lógica:** Detecta divergencia entre flujo de trading informado y precio. Posiciones de 5–20 minutos.
+- **Estado:** Solo paper trading. La ejecución live requiere órdenes sub-segundo que añaden complejidad significativa.
 
 ---
 
-## Quick Start
+## Quick Start (Paper Mode)
 
 ```bash
-# Arrancar todo
+git clone <repo-url> polyagent
+cd polyagent
 bash start.sh
-
-# Parar todo
-bash stop.sh
 ```
 
-### `start.sh` ejecuta 6 pasos:
+Esto arranca la API (puerto 8765), frontend (puerto 3000), y cron de Bond Hunter.
 
-1. Instala dependencias Python (`requirements.txt`)
-2. Inicializa la BD (crea tablas + migraciones)
-3. Arranca API FastAPI en puerto 8765
-4. Build + arranque de Next.js frontend en puerto 3000
-5. Configura cron job para Bond Hunter (cada 15 min)
-6. Auto-arranca IFNL-Lite runner si `enabled=1` en la BD
+Abre `http://localhost:3000` → login con `admin@polyagent.io` / `admin`.
 
-### Login
+---
+
+## Configuración de Trading Real (LIVE)
+
+### Requisitos Previos
+
+- **Python 3.9+** instalado
+- **Node.js 18+** instalado
+- **Cuenta de Polymarket con saldo USDC** (tu dinero real)
+- **`py-clob-client`** (se instala automáticamente con `requirements.txt`)
+- **Tokens POL** en tu wallet para gas fees (solo si usas MetaMask/EOA — ver Paso 5)
+
+### Paso 1: Exportar tu Private Key de Polymarket
+
+Tu private key es lo que firma las órdenes en tu nombre. **NUNCA la compartas con nadie.**
+
+#### Si te logueas con EMAIL (Magic Link) — lo más común:
+
+1. Ve a [polymarket.com](https://polymarket.com)
+2. Click en tu **icono de perfil** (arriba a la derecha)
+3. Click en **Settings**
+4. Busca **"Export Private Key"** y haz click
+5. Recibirás un email con un Magic Link — haz click para autenticarte
+6. La página muestra una caja borrosa — click en **"Reveal Private Key"**
+7. Copia el string hexadecimal de 64 caracteres (empieza con `0x`)
+8. **Quita el prefijo `0x`** — solo necesitas los 64 caracteres hex
+
+Ejemplo: si la key es `0xabcdef1234...`, guarda solo `abcdef1234...`
+
+#### Si te logueas con MetaMask:
+
+Tu private key es la de tu cuenta de MetaMask:
+
+1. Abre MetaMask → click en los tres puntos → **Account Details**
+2. Click en **"Export Private Key"**
+3. Introduce tu contraseña de MetaMask
+4. Copia la key (sin prefijo `0x`)
+
+### Paso 2: Encontrar tu Proxy Wallet (Funder Address)
+
+El **funder address** es tu proxy wallet de Polymarket — es donde están tus USDC y tus posiciones.
+
+**Opción A — Automático (recomendado):** El sistema lo deriva automáticamente de tu private key usando CREATE2. Solo tienes que pegar tu private key en la página Settings del dashboard y el funder address aparece solo.
+
+**Opción B — Manual:**
+1. Ve a [polymarket.com](https://polymarket.com)
+2. Click en tu **icono de perfil** (arriba a la derecha)
+3. Ve a **Settings**
+4. Tu **wallet address** está mostrada ahí — este es tu proxy/funder address
+5. Tiene este formato: `0x1234567890abcdef1234567890abcdef12345678`
+
+**Importante:** Esta NO es tu dirección de MetaMask (si usas MetaMask). Es un contrato proxy específico de Polymarket desplegado en Polygon. Cuando Polymarket muestra tu "Portfolio" y balance, está leyendo este proxy wallet.
+
+### Paso 3: Determinar tu Signature Type
+
+| Cómo te logueas en Polymarket | Signature Type | Valor |
+|-------------------------------|---------------|-------|
+| **Email / Google (Magic Link)** | POLY_PROXY | `1` |
+| **MetaMask / hardware wallet** | EOA | `0` |
+| **Gnosis Safe multisig** | GNOSIS_SAFE | `2` |
+
+**La mayoría de usuarios se loguean con email → usa `1`.**
+
+### Paso 4: Configurar Credenciales
+
+**Opción A — Dashboard Settings (recomendado):**
+
+1. Arranca el bot: `bash start.sh`
+2. Abre `http://localhost:3000` → Login → ve a **Settings** (menú lateral)
+3. Pega tu private key y selecciona tu tipo de wallet
+4. Click **"Save & Derive"** → auto-genera funder address + API credentials
+5. Click **"Test Connection"** para verificar
+
+**Opción B — Variables de entorno (.env):**
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+```env
+POLYAGENT_MODE=live
+POLYMARKET_PRIVATE_KEY=abcdef1234...  # 64 hex chars, SIN 0x
+POLYMARKET_FUNDER_ADDRESS=0x1234...   # Proxy wallet (o dejar vacío si usas Settings)
+POLYMARKET_SIGNATURE_TYPE=1           # 1=email, 0=MetaMask, 2=Gnosis
+POLYAGENT_LIVE_CAPITAL=500.00
+```
+
+**Opción C — OpenClaw Secrets** (ver sección Despliegue en OpenClaw más abajo).
+
+El sistema lee credenciales en este orden: **Database (Settings page) → Environment variables (.env / secrets)**. Si configuras via Settings, no necesitas `.env` para las credenciales.
+
+### Paso 5: Aprobar Token Allowances (Solo MetaMask/EOA)
+
+> **Salta este paso si te logueas con email/Magic Link (signature_type=1).** Los allowances se configuran automáticamente para cuentas Magic Link.
+
+Si usas MetaMask (signature_type=0), debes aprobar los contratos de exchange de Polymarket para que puedan mover tus USDC y conditional tokens. Esto requiere POL (gas token) en tu wallet.
+
+```bash
+# Instalar web3 (una sola vez)
+pip install web3
+
+# Ejecutar el script de allowances
+python3 scripts/set_allowances.py
+```
+
+Esto aprueba tres contratos:
+
+| Contrato | Dirección | Función |
+|----------|-----------|---------|
+| CTF Exchange | `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E` | Exchange principal |
+| Neg Risk CTF Exchange | `0xC5d563A36AE78145C45a50134d48A1215220f80a` | Exchange para mercados neg-risk |
+| Neg Risk Adapter | `0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296` | Adaptador de riesgo negativo |
+
+Para los tokens:
+
+| Token | Dirección |
+|-------|-----------|
+| USDC (Polygon) | `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` |
+| Conditional Tokens (CTF) | `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045` |
+
+**Solo necesitas hacer esto UNA VEZ por wallet.**
+
+### Paso 6: Generar API Credentials
+
+Las API credentials (key, secret, passphrase) autentican tus peticiones de trading al CLOB de Polymarket. Se derivan de tu private key.
+
+```bash
+# Generar y guardar credenciales
+python3 scripts/generate_api_creds.py
+```
+
+O deja que el bot lo haga automáticamente — si `POLYMARKET_API_KEY` está vacío en `.env`, el bot llama a `create_or_derive_api_creds()` al arrancar y guarda el resultado.
+
+**Lo que se genera:**
+
+| Credencial | Descripción | Ejemplo |
+|-----------|-------------|---------|
+| `POLYMARKET_API_KEY` | Identificador único de API | `a1b2c3d4-e5f6-...` |
+| `POLYMARKET_API_SECRET` | Secreto para firmar HMAC (base64) | `dGhpcyBpcyBh...` |
+| `POLYMARKET_API_PASSPHRASE` | Factor adicional de autenticación | `some-passphrase` |
+
+Estas credenciales se guardan en tu `.env`. Se pueden re-derivar en cualquier momento desde la misma private key (son determinísticas).
+
+**Cómo funciona la autenticación:**
+
+1. **L1 (firma con private key):** Prueba que controlas la wallet. Se usa para crear credenciales y firmar órdenes localmente.
+2. **L2 (API key + secret + passphrase):** Autentica peticiones HTTP al CLOB usando HMAC-SHA256. Se usa para trading, cancelaciones, y consultas autenticadas.
+
+Cada petición de trading envía estos headers:
+```
+POLY_ADDRESS      → tu dirección de wallet
+POLY_SIGNATURE    → firma HMAC-SHA256 de la petición
+POLY_TIMESTAMP    → timestamp UNIX actual
+POLY_API_KEY      → tu apiKey
+POLY_PASSPHRASE   → tu passphrase
+```
+
+El SDK `py-clob-client` maneja todo esto automáticamente.
+
+### Paso 7: Verificar Configuración
+
+Antes de ir live, ejecuta el script de verificación para comprobar todo:
+
+```bash
+python3 scripts/verify_config.py
+```
+
+Esto comprueba:
+
+- [x] Private key es válida y puede firmar mensajes
+- [x] Funder address coincide con el proxy wallet de la key
+- [x] API credentials funcionan (petición de prueba autenticada)
+- [x] Balance USDC en el proxy wallet (muestra fondos disponibles)
+- [x] Token allowances están configurados (para wallets EOA)
+- [x] Límites de capital son razonables (no exceden el balance de la wallet)
+
+Output esperado:
+```
+✓ Private key loaded (64 chars)
+✓ Funder address: 0x1234...5678
+✓ Signature type: 1 (POLY_PROXY)
+✓ API credentials valid
+✓ Proxy wallet USDC balance: $578.27
+✓ Live capital limit: $500.00 (69% of balance)
+✓ Max single position: $100.00
+✓ Daily loss limit: -$50.00
+✓ All checks passed — ready for live trading
+```
+
+### Paso 8: Arrancar en Modo Live
+
+```bash
+# Arrancar todo (el modo se lee de .env)
+bash start.sh
+```
+
+El bot va a:
+
+1. Inicializar la base de datos
+2. Conectar al CLOB API de Polymarket con tus credenciales
+3. Arrancar el servidor API + frontend dashboard
+4. Empezar a escanear oportunidades Bond Hunter cada 15 minutos
+5. **Colocar órdenes limit reales (GTC)** cuando detecte señales
+6. Monitorizar posiciones y registrar exits cuando los mercados resuelvan
+
+Monitoriza desde el dashboard en `http://localhost:3000`.
+
+---
+
+## Variables de Entorno — Referencia Completa
+
+### Obligatorias para Live Trading
+
+| Variable | Descripción | Ejemplo |
+|----------|-------------|---------|
+| `POLYAGENT_MODE` | Modo de trading: `paper` o `live` | `live` |
+| `POLYMARKET_PRIVATE_KEY` | Private key de wallet (64 hex chars, sin 0x) | `abcdef1234...` |
+| `POLYMARKET_FUNDER_ADDRESS` | Proxy wallet address de polymarket.com/settings | `0x1234...5678` |
+| `POLYMARKET_SIGNATURE_TYPE` | `0`=MetaMask, `1`=Email/Magic, `2`=Gnosis | `1` |
+
+### Límites de Capital y Riesgo
+
+| Variable | Descripción | Default |
+|----------|-------------|---------|
+| `POLYAGENT_LIVE_CAPITAL` | Capital máximo total que puede usar el bot (USDC) | `500.00` |
+| `POLYAGENT_MAX_POSITION` | Tamaño máximo de una posición individual (USDC) | `100.00` |
+| `POLYAGENT_MAX_DEPLOYED_PCT` | % máximo de capital desplegado a la vez (0.0-1.0) | `0.70` |
+| `POLYAGENT_DAILY_LOSS_LIMIT` | Para de tradear si el P&L del día baja de esto | `-50.00` |
+
+### Auto-Generadas (Override Opcional)
+
+| Variable | Descripción |
+|----------|-------------|
+| `POLYMARKET_API_KEY` | CLOB API key (auto-derivada de la private key) |
+| `POLYMARKET_API_SECRET` | CLOB API secret (base64) |
+| `POLYMARKET_API_PASSPHRASE` | CLOB API passphrase |
+
+### Infraestructura
+
+| Variable | Descripción | Default |
+|----------|-------------|---------|
+| `POLYAGENT_DB` | Path de la base de datos SQLite | `./data/polyagent.db` |
+| `POLYAGENT_DATA_DIR` | Directorio de datos | `./data` |
+| `API_URL` | URL del backend para proxy de Next.js | `http://localhost:8765` |
+| `POLYMARKET_CLOB_HOST` | Endpoint del CLOB API | `https://clob.polymarket.com` |
+| `POLYMARKET_CHAIN_ID` | Chain ID de Polygon | `137` |
+| `POLYGON_RPC_URL` | RPC de Polygon (solo para allowances) | `https://polygon-rpc.com` |
+
+---
+
+## Safety Rails (Protecciones)
+
+El bot incluye múltiples mecanismos de seguridad para proteger tu capital:
+
+### Límites de Capital
+
+- **Cap total** (`POLYAGENT_LIVE_CAPITAL`): El bot NUNCA despliega más de esta cantidad, sin importar cuánto haya en la wallet. Default: $500.
+- **Cap por posición** (`POLYAGENT_MAX_POSITION`): Ningún trade individual excede esto. Default: $100.
+- **Cap de despliegue** (`POLYAGENT_MAX_DEPLOYED_PCT`): Como máximo el 70% del capital activo a la vez.
+
+### Protección contra Pérdidas
+
+- **Límite diario** (`POLYAGENT_DAILY_LOSS_LIMIT`): El bot pausa todo el trading si el P&L acumulado del día baja de este umbral. Default: -$50.
+- **Sin market orders**: Bond Hunter usa **solo órdenes limit (GTC)** a precios calculados. Cero market orders que puedan sufrir slippage.
+
+### Verificación de Órdenes
+
+- **Check de balance**: Antes de cada orden, el bot verifica que hay suficiente USDC en el proxy wallet.
+- **Logging doble**: Cada orden real se registra en la BD con el order ID del CLOB para auditoría.
+- **Confirmación de orden**: El bot espera confirmación del CLOB antes de registrar la posición.
+
+### Kill Switch
+
+- **Dashboard**: Botón "STOP" con un click cancela todas las órdenes abiertas y desactiva el bot.
+- **API**: Endpoints `POST /bot/disable` + `POST /orders/cancel-all`.
+- **CLI**: `python3 agent.py --cancel-all` cancela todas las órdenes abiertas inmediatamente.
+- **Manual**: `bash stop.sh` mata todos los procesos y elimina el cron.
+
+### Aislamiento de Modos
+
+- Paper y live se almacenan con columnas separadas (`mode = 'paper'` vs `mode = 'live'`).
+- El modo paper NUNCA toca el CLOB API para órdenes.
+- Puedes ejecutar paper y live en paralelo para comparar resultados.
+
+---
+
+## Cómo Funciona el Trading Real (Bond Hunter)
+
+### Flujo de Ejecución (cada 15 minutos)
 
 ```
-http://TU_IP:3000
-Email: admin@polyagent.io
-Password: admin
+1. Cron dispara: python3 agent.py --mode live --strategy bond_hunter
+
+2. FASE DE RESOLUCIÓN
+   ├─ Consulta señales abiertas (status='open', mode='live')
+   ├─ Para cada señal, consulta si el mercado resolvió (Gamma API)
+   ├─ Si resolvió YES → tokens se redimen automáticamente a $1.00
+   │   └─ P&L = (shares × $1.00) - position_usdc - fees
+   ├─ Si resolvió NO → pérdida total de la posición
+   │   └─ P&L = -position_usdc - fees
+   └─ Actualiza status='resolved' con P&L
+
+3. FASE DE ESCANEO
+   ├─ Fetch mercados abiertos de Gamma API
+   ├─ Filtrar por: precio 0.92–0.995, liquidez, profit mínimo, wash score
+   ├─ Para cada mercado que pasa los filtros:
+   │
+   │   a. CHECK DE BALANCE
+   │   │   └─ Verifica USDC disponible en proxy wallet via CLOB API
+   │   │
+   │   b. CHECK DE LÍMITES
+   │   │   ├─ Capital desplegado actual < max_deployed_pct × live_capital
+   │   │   ├─ P&L del día > daily_loss_limit
+   │   │   └─ Si falla cualquier check → skip mercado
+   │   │
+   │   c. POSITION SIZING (Kelly fraccionado)
+   │   │   ├─ kelly_f = (p × b - q) / b   [p=win_prob, b=payout, q=1-p]
+   │   │   ├─ position = min(kelly_f × capital × kelly_fraction,
+   │   │   │                 capital × max_position_pct,
+   │   │   │                 max_position_usdc)
+   │   │   └─ shares = position_usdc / ask_price
+   │   │
+   │   d. COLOCAR ORDEN LIMIT (GTC)
+   │   │   ├─ Crear OrderArgs(token_id, price, size, side=BUY)
+   │   │   ├─ Firmar con private key: client.create_order(order_args)
+   │   │   ├─ Enviar al CLOB: client.post_order(signed_order, OrderType.GTC)
+   │   │   └─ Recibir order_id de confirmación
+   │   │
+   │   e. REGISTRAR EN BD
+   │       ├─ INSERT en signals con mode='live', order_id, status='open'
+   │       └─ Log del trade para auditoría
+   │
+   └─ Fin del scan
+
+4. RESOLUCIÓN DE POSICIONES
+   ├─ Bond Hunter NO vende tokens — espera resolución del mercado
+   ├─ Cuando el mercado resuelve YES:
+   │   └─ Los YES tokens se convierten automáticamente en $1.00 USDC
+   │       (redención on-chain, no requiere acción del bot)
+   ├─ Cuando el mercado resuelve NO:
+   │   └─ Los YES tokens valen $0.00 — pérdida registrada
+   └─ El bot actualiza el P&L en el siguiente scan (fase de resolución)
+```
+
+### Código de Inicialización del CLOB Client
+
+```python
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
+
+# Inicializar cliente
+client = ClobClient(
+    host="https://clob.polymarket.com",   # POLYMARKET_CLOB_HOST
+    key=private_key,                       # POLYMARKET_PRIVATE_KEY
+    chain_id=137,                          # POLYMARKET_CHAIN_ID (Polygon)
+    signature_type=1,                      # POLYMARKET_SIGNATURE_TYPE
+    funder=funder_address                  # POLYMARKET_FUNDER_ADDRESS
+)
+
+# Configurar API credentials (auto-derivar o usar guardadas)
+client.set_api_creds(client.create_or_derive_api_creds())
+
+# Colocar orden limit GTC para comprar YES tokens
+order_args = OrderArgs(
+    token_id="<yes-token-id>",    # ID del token YES del mercado
+    price=0.96,                    # Precio limit (ej: $0.96 por token)
+    size=50.0,                     # Cantidad de tokens a comprar
+    side=BUY                       # Lado: comprar
+)
+signed_order = client.create_order(order_args)
+response = client.post_order(signed_order, OrderType.GTC)
+# response contiene el order_id para tracking
 ```
 
 ---
 
-## Estructura del Proyecto
+## Arquitectura del Proyecto
 
 ```
 polyagent/
-├── agent.py              # Core trading engine (strategy dispatch, DB init)
-├── api.py                # FastAPI REST server (port 8765)
-├── backtest.py           # Backtest runner histórico
-├── migrations.sql        # TODAS las migraciones de BD (para OpenClaw)
-├── requirements.txt      # Deps: fastapi, uvicorn, requests, websockets, aiohttp
-├── start.sh              # Arranque completo (6 pasos)
-├── stop.sh               # Parada de todos los procesos + cron
+├── agent.py              # Core: DB init, strategy dispatch, CLI
+├── api.py                # FastAPI REST server (puerto 8765)
+├── clob_client.py        # Wrapper del CLOB client de Polymarket (NUEVO — live trading)
+├── backtest.py           # Runner de backtests históricos
+├── migrations.sql        # Todas las migraciones de BD (para OpenClaw)
+├── requirements.txt      # Deps: py-clob-client, fastapi, websockets, etc.
+├── start.sh              # Orquestación completa (6 pasos)
+├── stop.sh               # Kill de todos los procesos + cron
+├── .env.example          # Template de configuración (copiar a .env)
+├── .env                  # Tus secretos (gitignored, NUNCA committed)
+├── scripts/
+│   ├── generate_api_creds.py   # Generación one-time de API credentials
+│   ├── set_allowances.py       # Aprobación one-time de tokens (solo MetaMask)
+│   └── verify_config.py        # Check pre-vuelo de configuración
 ├── strategies/
 │   ├── __init__.py       # Strategy registry (STRATEGY_REGISTRY)
 │   ├── base.py           # BaseStrategy ABC
-│   ├── bond_hunter.py    # Bond Hunter (cron, cada 15 min)
+│   ├── bond_hunter.py    # Bond Hunter (cron, paper+live)
 │   └── ifnl_lite/
 │       ├── __init__.py       # IfnlLiteStrategy class
 │       ├── ifnl_runner.py    # Async runner (main loop)
 │       ├── ws_client.py      # WebSocket (book/trades real-time)
-│       ├── data_api.py       # REST poller (wallet-attributed trades)
+│       ├── data_api.py       # REST poller (trades con wallet IDs)
 │       ├── market_selector.py # Filtro de mercados elegibles
 │       ├── microstructure.py  # Book imbalance, absorption, trade flow
 │       ├── signal_engine.py   # IFS computation, divergencia
@@ -111,7 +495,7 @@ polyagent/
 │   ├── agent.log
 │   ├── ifnl_lite.log
 │   ├── ifnl_lite.pid
-│   └── ifnl_lite_status.json   # Métricas live del runner (cada 10s)
+│   └── ifnl_lite_status.json
 └── frontend/
     ├── next.config.mjs   # Proxy /api/* → localhost:8765
     └── src/
@@ -126,59 +510,61 @@ polyagent/
 
 ## Base de Datos
 
-### Ubicación
+### Ubicación y Persistencia
 
 | Entorno | Path | Configurado por |
 |---------|------|-----------------|
-| Docker/OpenClaw | `/app/data/polyagent.db` | Default (volumen montado) |
+| Docker/OpenClaw | `/app/data/polyagent.db` | Default (volumen montado `./data:/app/data`) |
 | Local | `./data/polyagent.db` | `start.sh` exporta `POLYAGENT_DB` |
+| Custom | Cualquier path | `export POLYAGENT_DB=/mi/path/db` |
 
 ### Migraciones
 
-**IMPORTANTE:** Todos los cambios de esquema están en `migrations.sql`. Este fichero es idempotente (seguro ejecutar múltiples veces).
+**IMPORTANTE:** Todos los cambios de esquema están en `migrations.sql`. Es idempotente (seguro ejecutar múltiples veces).
 
 ```bash
 # Inicializar tablas base
 python3 agent.py --mode paper --force
 
-# Aplicar migraciones (strategies, IFNL tables, seed data)
+# Aplicar migraciones
 sqlite3 data/polyagent.db < migrations.sql
 ```
 
-`start.sh` ejecuta ambos comandos automáticamente. Para OpenClaw, asegurarse de que `migrations.sql` se ejecuta después de `init_db()`.
+`start.sh` ejecuta ambos automáticamente.
 
-### Tablas
+### Tablas Principales
 
 | Tabla | Descripción |
 |-------|-------------|
 | `config` | Parámetros Bond Hunter (singleton, id=1) |
 | `bot_status` | Estado del bot Bond Hunter (singleton, id=1) |
-| `signals` | Señales paper trading de Bond Hunter |
-| `scan_log` | Historial de scans de Bond Hunter |
-| `strategies` | **Registry de estrategias** (slug, type, enabled, config_json) |
-| `ifnl_signals` | Señales paper trading de IFNL-Lite |
+| `signals` | Señales de Bond Hunter (paper + live, diferenciadas por `mode`) |
+| `scan_log` | Historial de scans |
+| `strategies` | Registry de estrategias (slug, type, enabled, capital, config_json) |
+| `ifnl_signals` | Señales de IFNL-Lite |
 | `ifnl_wallet_profiles` | Scores pre-computados de wallets |
 | `ifnl_wallet_trades` | Datos raw de trades para profiling |
-| `runs` / `trades` | Resultados de backtest |
+| `credentials` | Private key, funder address, API creds (singleton, id=1) |
+| `runs` / `trades` | Resultados de backtests |
 
 ---
 
 ## API Endpoints
 
-### Multi-Strategy (nuevos)
+### Multi-Strategy
 
 | Method | Path | Descripción |
 |--------|------|-------------|
 | GET | `/strategies` | Lista todas las estrategias |
 | GET | `/strategies/{slug}` | Detalle de estrategia + config con defaults |
 | POST | `/strategies/{slug}/config` | Actualizar config de estrategia |
-| POST | `/strategies/{slug}/enable` | Activar estrategia (lanza runner si continuous) |
-| POST | `/strategies/{slug}/disable` | Desactivar (para runner si continuous) |
+| POST | `/strategies/{slug}/enable` | Activar estrategia |
+| POST | `/strategies/{slug}/disable` | Desactivar estrategia |
 | POST | `/strategies/{slug}/scan-now` | Scan inmediato (solo cron strategies) |
 | GET | `/strategies/{slug}/signals` | Señales de la estrategia |
 | GET | `/strategies/{slug}/signals/open` | Señales abiertas |
 | GET | `/strategies/{slug}/stats` | Stats específicos |
-| GET | `/strategies/{slug}/activity` | Métricas live del engine (lee status file) |
+| GET | `/strategies/{slug}/activity` | Métricas live del engine |
 
 ### Legacy Bond Hunter
 
@@ -186,186 +572,211 @@ sqlite3 data/polyagent.db < migrations.sql
 |--------|------|-------------|
 | GET | `/config` | Config Bond Hunter |
 | POST | `/config` | Update config |
-| GET | `/bot` | Estado del bot |
-| POST | `/bot/enable` / `/bot/disable` | Control del bot |
+| GET/POST | `/bot`, `/bot/enable`, `/bot/disable` | Control del bot |
 | POST | `/bot/scan-now` | Scan inmediato |
-| GET | `/signals` | Señales (params: status, limit, offset) |
+| GET | `/signals`, `/signals/open` | Señales |
 | GET | `/stats` | KPIs agregados |
 
----
+### Settings / Credentials
 
-## Gestión de Procesos
+| Method | Path | Descripción |
+|--------|------|-------------|
+| GET | `/settings/credentials` | Obtener credenciales (private key enmascarada) |
+| POST | `/settings/credentials` | Guardar private key → auto-deriva funder + API creds |
+| POST | `/settings/credentials/test` | Test de conexión CLOB API |
+| GET | `/trading-mode` | Modo actual (paper/live) |
+| POST | `/orders/cancel-all` | Cancelar todas las órdenes abiertas (solo live) |
 
-### Bond Hunter (cron)
+### Utilidad
 
-- **Tipo:** cron (cada 15 min)
-- **Mecanismo:** `crontab` ejecuta `python3 agent.py --mode paper`
-- **Control:** Enable/disable desde dashboard o API. El cron siempre corre pero respeta el flag `enabled` en `bot_status`
-- **Sin estado en memoria** — cada ejecución es independiente
-
-### IFNL-Lite (continuous)
-
-- **Tipo:** proceso persistente en background
-- **Mecanismo:** `python3 -m strategies.ifnl_lite.ifnl_runner --db <path>`
-- **Start:** `POST /strategies/ifnl_lite/enable` → API spawns subprocess
-- **Stop:** `POST /strategies/ifnl_lite/disable` → API envía SIGTERM
-- **PID:** Guardado en `logs/ifnl_lite.pid` por la API
-- **Auto-start en boot:** `start.sh` paso 6 comprueba `enabled=1` en BD y lanza el runner
-- **Stop en shutdown:** `stop.sh` mata el runner vía PID file + `pkill -f ifnl_runner`
-
-### Flujo en OpenClaw (restart del container)
-
-Cuando el container se reinicia:
-
-1. `start.sh` ejecuta como entrypoint
-2. Paso 2: BD ya existe en el volumen montado (`./data:/app/data`) — solo aplica migraciones nuevas
-3. Paso 6: Detecta si IFNL-Lite tiene `enabled=1` en BD y auto-lanza el runner
-4. **No requiere acción del usuario** — el runner se reanuda automáticamente
-
-Cuando el usuario pulsa "Start Strategy" en el dashboard:
-
-1. Frontend llama `POST /strategies/ifnl_lite/enable`
-2. API pone `enabled=1` en BD y spawn subprocess `ifnl_runner`
-3. Runner conecta al WebSocket de Polymarket, selecciona mercados, empieza a monitorizar
-4. PID guardado en `logs/ifnl_lite.pid`
-5. Si el container reinicia después, paso 6 de `start.sh` ve `enabled=1` y re-lanza
+| Method | Path | Descripción |
+|--------|------|-------------|
+| GET | `/health` | Estado + DB path + mode + timestamp |
+| GET | `/scan-logs` | Historial de scans |
+| GET | `/runs`, `/runs/{id}`, `/runs/{id}/trades` | Datos de backtest |
 
 ---
 
-## Config Defaults de Estrategias
+## Dashboard
 
-Los configs se guardan como JSON en `strategies.config_json`. La API los devuelve con defaults del código Python:
+Accede en `http://localhost:3000` después de ejecutar `start.sh`.
 
-```python
-defaults = strategy_instance.default_config()  # definidos en Python
-stored = json.loads(row["config_json"])          # guardados en BD
-config = {**defaults, **stored}                  # stored overrides defaults
+| Página | Descripción |
+|--------|-------------|
+| `/dashboard` | KPIs, gráfico P&L, señales activas, control del bot |
+| `/strategies` | Cards de configuración (Bond Hunter, IFNL-Lite) |
+| `/settings` | Configurar credenciales de Polymarket (private key, auto-derive funder + API creds) |
+| `/logs` | Historial de ejecución de scans |
+
+Login: `admin@polyagent.io` / `admin`
+
+---
+
+## Despliegue en OpenClaw
+
+### Configuración de Secretos
+
+En el panel de OpenClaw, configura estas variables como **secretos**:
+
+**Obligatorios:**
+```
+POLYAGENT_MODE=live
+POLYMARKET_PRIVATE_KEY=<tu-private-key-64-hex-sin-0x>
+POLYMARKET_SIGNATURE_TYPE=1
 ```
 
-Esto significa:
-- Una estrategia nueva con `config_json='{}'` devuelve todos los defaults
-- El usuario solo guarda valores que quiere cambiar
-- Los defaults viven en el código Python, **no en la BD** — no se necesita migración para cambiar defaults
-
----
-
-## Variables de Entorno
-
-| Variable | Default | Descripción |
-|----------|---------|-------------|
-| `POLYAGENT_DB` | `/app/data/polyagent.db` | Path de la BD SQLite |
-| `POLYAGENT_DATA_DIR` | `./data` | Directorio de datos |
-| `API_URL` | `http://localhost:8765` | URL del backend para proxy Next.js |
-
----
-
-## Estrategia Bond Hunter — Detalle
-
-### Concepto
-
-Compra tokens YES en mercados donde el precio es > 0.95 (> 95% probabilidad). Cuando el mercado resuelve YES (como se espera), cobra $1.00 por token. Ganancia típica: 1.5%–5% en 1–48 horas.
-
-### Filtros
-
-1. **Binario** — solo mercados YES/NO
-2. **Rango de precio** — 0.95 ≤ precio ≤ 0.995
-3. **Tiempo al cierre** — entre 1h y 48h
-4. **Liquidez** — mínimo $500
-5. **Anti-wash trading** — descarta volumen artificial
-6. **Profit neto** — beneficio tras fees > 1.5%
-
-### Position Sizing (Kelly fraccionado)
-
+**Opcionales (se auto-derivan si faltan):**
 ```
-position = min(kelly_f * capital * kelly_fraction, capital * max_position_pct)
+POLYMARKET_FUNDER_ADDRESS=<auto-derivado-de-private-key-via-CREATE2>
+POLYMARKET_API_KEY=<auto-derivado-de-private-key>
+POLYMARKET_API_SECRET=<auto-derivado>
+POLYMARKET_API_PASSPHRASE=<auto-derivado>
 ```
 
-Con `kelly_fraction=0.25` y `max_position_pct=0.15`, nunca más del 15% del capital por señal.
-
----
-
-## Estrategia IFNL-Lite — Detalle
-
-### Concepto
-
-Detecta cuando wallets "informados" (con historial de trading rentable) compran en una dirección pero el precio no se mueve. Esta divergencia entre flujo informado y precio sugiere que el precio va a corregirse.
-
-### Componentes
-
-1. **WebSocket Client** — Recibe book updates y trades en tiempo real de Polymarket
-2. **Data API Poller** — Cada ~15s consulta trades recientes con `proxyWallet` para identificar wallets
-3. **Market Selector** — Cada 5 min selecciona los top 10 mercados por volumen × liquidez
-4. **Microstructure Engine** — Calcula book_imbalance, trade_imbalance, absorption, mid_drift
-5. **Signal Engine** — Computa IFS (Informed Flow Score), detecta divergencia, genera señales
-6. **Execution Manager** — Paper positions con TP (80% expected move), SL (22 bps), time stop (20 min)
-7. **Wallet Profiler** — Offline (diario): computa markout P&L a 5m/30m/2h para cada wallet
-
-### Señal: Condiciones
-
+**Límites de capital:**
 ```
-divergence > 18 bps
-AND book_imbalance confirma dirección (> 0.15)
-AND absorption es alta (liquidity pasiva absorbe flujo informado)
-AND al menos 2 wallets informados activos (informed_score >= 0.65)
+POLYAGENT_LIVE_CAPITAL=500.00
+POLYAGENT_MAX_POSITION=100.00
+POLYAGENT_MAX_DEPLOYED_PCT=0.70
+POLYAGENT_DAILY_LOSS_LIMIT=-50.00
 ```
 
-### Exit Rules
+**Nota:** Si solo configuras `POLYMARKET_PRIVATE_KEY`, el sistema auto-deriva el funder address (CREATE2) y las API credentials al arrancar. Pero se recomienda configurar `POLYMARKET_FUNDER_ADDRESS` también para evitar problemas si la derivación falla.
 
-- **Take Profit:** mid moved ≥ 80% of expected_move
-- **Hard Stop:** mid moved contra > 22 bps
-- **Time Stop:** > 20 min holding (o < 6 bps progress después de 5 min)
-- **Invalidation:** book flip o flow decay (sin trades informados 90s)
-- **Cooldown:** 10 min per market tras stop/invalidation
+**Alternativa:** Configura las credenciales desde la página **Settings** del dashboard después del primer arranque. Las credenciales se guardan en la BD (que persiste en el volumen) y sobreviven rebuilds.
 
----
+### Reset de Base de Datos (primer despliegue)
 
-## Monitorización en Tiempo Real
-
-### Engine Activity Panel
-
-Cuando IFNL-Lite está activo, el dashboard muestra un panel **Engine Activity** con métricas live:
-
-- **Process:** Running / Offline
-- **Uptime:** tiempo desde arranque
-- **WebSocket:** estado de conexión
-- **Markets:** número de mercados monitorizados + nombres
-- **Book States:** estados de libro de órdenes activos
-- **Trades Captured:** trades procesados desde el data poller
-- **Wallets Seen:** wallets únicos identificados
-- **Flow Entries:** entradas en el acumulador de flujo
-- **Signals Generated:** señales producidas
-
-### Cómo funciona
-
-1. El runner escribe `logs/ifnl_lite_status.json` cada 10 segundos con todas las métricas
-2. La API lee ese fichero en `GET /strategies/ifnl_lite/activity`
-3. Si el fichero tiene >60s sin actualizarse, la API marca `possibly_stale: true`
-4. El frontend (`IfnlActivityPanel`) poll cada 10s vía SWR y muestra indicador "● LIVE" (verde) o "○ OFFLINE" (gris)
-
-### Verificar que IFNL funciona
+**IMPORTANTE:** Antes del primer arranque en live (o cuando se quiera empezar con datos limpios), ejecutar:
 
 ```bash
-# Verificar que el runner está corriendo
-cat logs/ifnl_lite.pid && ps -p $(cat logs/ifnl_lite.pid)
+# Reset completo (borra señales paper, stats, logs — todo limpio)
+bash reset_db.sh
 
-# Ver métricas live
-cat logs/ifnl_lite_status.json | python3 -m json.tool
-
-# Ver logs del runner
-tail -f logs/ifnl_lite.log
-
-# Verificar desde la API
-curl http://localhost:8765/strategies/ifnl_lite/activity | python3 -m json.tool
+# Reset preservando credenciales (si ya se configuraron via Settings)
+bash reset_db.sh --keep-creds
 ```
+
+Este script:
+1. Borra la BD existente (con datos paper)
+2. La recrea limpia con todas las tablas y seeds
+3. Aplica `migrations.sql`
+4. Opcionalmente restaura las credenciales guardadas
+
+**En OpenClaw:** Ejecutar `bash reset_db.sh` una sola vez antes del primer `bash start.sh`. Después de eso, `start.sh` es el único entrypoint necesario.
+
+### Entrypoint
+
+Usa `bash start.sh` como entrypoint del container.
+
+### Flujo de Arranque (start.sh)
+
+```
+[1/6] Instalar dependencias Python (pip install -r requirements.txt)
+[2/6] Inicializar BD + aplicar migrations.sql
+      → Crea tablas: signals, strategies, credentials, config, etc.
+      → Seeds: Bond Hunter (enabled), IFNL-Lite (disabled)
+[3/6] Arrancar API FastAPI (uvicorn, puerto 8765)
+[4/6] Build + arrancar frontend Next.js (puerto 3000)
+[5/6] Configurar cron: */15 * * * * agent.py --mode $POLYAGENT_MODE
+[6/6] Auto-arrancar IFNL-Lite si enabled=1 en BD
+```
+
+### Persistencia de Datos
+
+```yaml
+volumes:
+  - ./data:/app/data    # BD SQLite + datos persistentes
+```
+
+La BD (`polyagent.db`) sobrevive rebuilds del container. Contiene:
+- Credenciales guardadas desde Settings
+- Señales históricas (paper + live)
+- Config de estrategias
+- Perfiles de wallets (IFNL)
+
+### Restart del Container
+
+Cuando el container se reinicia:
+- La BD ya existe en el volumen → solo aplica migraciones nuevas
+- Credenciales persisten en la BD → no hay que reconfigurar
+- IFNL-Lite se auto-lanza si estaba enabled
+- Bond Hunter continúa via cron
+- **No requiere acción del usuario**
+
+### Puertos
+
+| Puerto | Servicio | Descripción |
+|--------|----------|-------------|
+| 3000 | Frontend Next.js | Dashboard (proxy a API via /api/*) |
+| 8765 | API FastAPI | REST API + Swagger (/docs) |
+
+Expón el puerto 3000 en OpenClaw para acceder al dashboard.
+
+---
+
+## Troubleshooting
+
+### "Invalid API key" o errores 401
+
+Tus API credentials pueden haber expirado o son incorrectas.
+
+```bash
+# Re-derivar credenciales desde tu private key
+python3 scripts/generate_api_creds.py
+```
+
+### "Insufficient balance" al colocar órdenes
+
+El bot verifica tu balance USDC real antes de cada trade. Si tu balance bajó (ej: tradeaste manualmente en polymarket.com), el bot respeta el balance real.
+
+### Las órdenes no se llenan (fills)
+
+Bond Hunter usa órdenes limit (GTC). Si el mercado se mueve antes de que tu orden se llene, puede quedarse sin ejecutar. El bot monitoriza órdenes abiertas y cancela las que llevan demasiado tiempo.
+
+### "Allowance too low" (solo MetaMask/EOA)
+
+```bash
+python3 scripts/set_allowances.py
+```
+
+### El bot colocó una orden que no quiero
+
+1. Click en **STOP** en el dashboard (cancela todas las órdenes + desactiva bot)
+2. O via API: `curl -X POST http://localhost:8765/bot/disable`
+3. O mata todo: `bash stop.sh`
+4. Verifica en polymarket.com que tus posiciones estén correctas
+
+### Cambiar entre paper y live
+
+Edita `.env`:
+```env
+POLYAGENT_MODE=paper   # o live
+```
+
+Luego reinicia:
+```bash
+bash stop.sh && bash start.sh
+```
+
+Las señales paper y live se almacenan por separado — cambiar de modo no afecta datos históricos.
 
 ---
 
 ## Comandos Útiles
 
 ```bash
-# Scan manual Bond Hunter
-export POLYAGENT_DB=./data/polyagent.db
+# Arrancar todo
+bash start.sh
+
+# Parar todo
+bash stop.sh
+
+# Scan manual Bond Hunter (paper)
 python3 agent.py --mode paper --force
+
+# Scan manual Bond Hunter (live — ¡coloca órdenes reales!)
+python3 agent.py --mode live --force
 
 # Backtest
 python3 agent.py --mode backtest --days 60 --capital 500
@@ -376,24 +787,42 @@ python3 -m strategies.ifnl_lite.ifnl_runner --db data/polyagent.db
 # Wallet profiler (diario)
 python3 -m strategies.ifnl_lite.wallet_profiler --db data/polyagent.db
 
-# Check API
+# Verificar configuración live
+python3 scripts/verify_config.py
+
+# Check API health
+curl http://localhost:8765/health
+
+# Ver estrategias
 curl http://localhost:8765/strategies | python3 -m json.tool
 
+# Ver señales abiertas
+curl http://localhost:8765/signals/open | python3 -m json.tool
+
 # Logs
-tail -f logs/api.log
 tail -f logs/agent.log
+tail -f logs/api.log
 tail -f logs/ifnl_lite.log
 ```
 
 ---
 
-## Notas para OpenClaw
+## Seguridad
 
-1. **Ejecutar `bash start.sh`** una vez — inicializa todo automáticamente
-2. **`migrations.sql`** contiene TODOS los cambios de esquema. Si la BD ya existe, `start.sh` aplica migraciones. Si se necesita aplicar manualmente: `sqlite3 data/polyagent.db < migrations.sql`
-3. **La BD persiste** en el volumen montado `./data:/app/data` — sobrevive rebuilds del container
-4. **Bond Hunter** se gestiona solo vía cron — no necesita intervención
-5. **IFNL-Lite** se auto-arranca si estaba enabled antes del restart — paso 6 de `start.sh` lo detecta
-6. **Control desde la UI** — Start/Stop de cada estrategia desde el dashboard
-7. **Dependencias nuevas:** `websockets` y `aiohttp` (en `requirements.txt`) son necesarias para IFNL-Lite
-8. **No hay auth en la API** — CORS abierto, credenciales hardcodeadas en el frontend
+- **Private keys** se almacenan en la BD (`credentials` table) o en `.env` (gitignored). Nunca committed a version control.
+- **API credentials** se auto-derivan de tu private key y se guardan en BD o `.env`.
+- **Sin almacenamiento en la nube** — todo corre localmente o en tu propio servidor.
+- **Auth del dashboard** es local-only (hardcoded `admin/admin`). Si expones a internet, añade auth real.
+- **Permisos USDC** se otorgan solo a contratos oficiales de exchange de Polymarket.
+- **Kill switch** disponible en dashboard, API, y CLI para emergencias.
+
+---
+
+## Referencias
+
+- [Polymarket py-clob-client (GitHub)](https://github.com/Polymarket/py-clob-client)
+- [Polymarket CLOB Authentication Docs](https://docs.polymarket.com/developers/CLOB/authentication)
+- [Polymarket Proxy Wallet Docs](https://docs.polymarket.com/developers/proxy-wallet)
+- [CLOB Allowance Setup (Gist)](https://gist.github.com/poly-rodr/44313920481de58d5a3f6d1f8226bd5e)
+- [py-clob-client en PyPI](https://pypi.org/project/py-clob-client/) (v0.34.6)
+- [Guía de Generación de API Keys](https://jeremywhittaker.com/index.php/2024/08/28/generating-api-keys-for-polymarket-com/)
