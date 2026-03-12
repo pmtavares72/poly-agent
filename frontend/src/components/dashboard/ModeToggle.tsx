@@ -2,53 +2,85 @@
 import { useState } from 'react'
 
 interface ModeToggleProps {
-  mode: string
-  onSwitch: (mode: string) => Promise<void>
+  paperEnabled: boolean
+  liveEnabled: boolean
+  onTogglePaper: (enabled: boolean) => Promise<void>
+  onToggleLive: (enabled: boolean) => Promise<void>
   disabled?: boolean
 }
 
-export function ModeToggle({ mode, onSwitch, disabled }: ModeToggleProps) {
-  const [confirming, setConfirming] = useState(false)
-  const isLive = mode === 'live'
+export function ModeToggle({ paperEnabled, liveEnabled, onTogglePaper, onToggleLive, disabled }: ModeToggleProps) {
+  const [confirmingLive, setConfirmingLive] = useState(false)
 
-  async function handleClick() {
-    if (isLive) {
-      // Switching to paper — no confirmation needed
-      await onSwitch('paper')
-      return
+  async function handlePaper() {
+    await onTogglePaper(!paperEnabled)
+  }
+
+  async function handleLive() {
+    if (!liveEnabled) {
+      if (!confirmingLive) {
+        setConfirmingLive(true)
+        setTimeout(() => setConfirmingLive(false), 4000)
+        return
+      }
+      setConfirmingLive(false)
     }
-    // Switching to live — require confirmation
-    if (!confirming) {
-      setConfirming(true)
-      setTimeout(() => setConfirming(false), 4000)
-      return
-    }
-    setConfirming(false)
-    await onSwitch('live')
+    await onToggleLive(!liveEnabled)
   }
 
   return (
+    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+      <ToggleBtn
+        label="PAPER"
+        active={paperEnabled}
+        color="var(--yellow)"
+        onClick={handlePaper}
+        disabled={disabled}
+      />
+      <ToggleBtn
+        label={confirmingLive ? 'CONFIRM?' : 'LIVE'}
+        active={liveEnabled}
+        color="var(--red)"
+        onClick={handleLive}
+        disabled={disabled}
+      />
+    </div>
+  )
+}
+
+function ToggleBtn({ label, active, color, onClick, disabled }: {
+  label: string
+  active: boolean
+  color: string
+  onClick: () => void
+  disabled?: boolean
+}) {
+  return (
     <button
-      onClick={handleClick}
+      onClick={onClick}
       disabled={disabled}
       style={{
-        display: 'inline-flex', alignItems: 'center', gap: 6,
+        display: 'inline-flex', alignItems: 'center', gap: 5,
         padding: '4px 10px', borderRadius: 6,
-        border: `1px solid ${isLive ? 'var(--red)' : 'var(--yellow)'}`,
-        background: isLive ? 'rgba(231,76,60,0.1)' : 'rgba(240,180,41,0.1)',
+        border: `1px solid ${active ? color : 'var(--border)'}`,
+        background: active ? `${color}15` : 'transparent',
         cursor: disabled ? 'not-allowed' : 'pointer',
         fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 700,
         letterSpacing: '0.08em',
-        color: isLive ? 'var(--red)' : 'var(--yellow)',
+        color: active ? color : 'var(--text3)',
         transition: 'all 0.2s',
         opacity: disabled ? 0.5 : 1,
       }}
     >
       <span style={{
         width: 6, height: 6, borderRadius: '50%',
-        background: isLive ? 'var(--red)' : 'var(--yellow)',
+        background: active ? color : 'var(--text3)',
+        opacity: active ? 1 : 0.3,
       }} />
-      {confirming ? 'CONFIRM LIVE?' : isLive ? 'LIVE' : 'PAPER'}
+      {label}
+      <span style={{ fontSize: 8, marginLeft: 2, opacity: 0.7 }}>
+        {active ? 'ON' : 'OFF'}
+      </span>
     </button>
   )
 }

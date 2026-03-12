@@ -144,3 +144,11 @@ CREATE TABLE IF NOT EXISTS credentials (
     updated_at      TEXT
 );
 INSERT OR IGNORE INTO credentials (id) VALUES (1);
+
+-- ===========================================
+-- Migration 008: Independent paper/live toggles
+-- Added: paper_enabled + live_enabled on bot_status
+-- Cron runs both modes independently based on these flags
+-- ===========================================
+ALTER TABLE bot_status ADD COLUMN paper_enabled INTEGER DEFAULT 1;
+ALTER TABLE bot_status ADD COLUMN live_enabled INTEGER DEFAULT 0;

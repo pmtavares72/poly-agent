@@ -22,12 +22,14 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
 }
 
 // Stats
-export const fetchStats = () => get<Stats>('/stats')
+export const fetchStats = (mode?: string) =>
+  get<Stats>(mode ? `/stats?mode=${mode}` : '/stats')
 
 // Signals
-export const fetchSignals = (params?: { status?: string; limit?: number; offset?: number }) => {
+export const fetchSignals = (params?: { status?: string; limit?: number; offset?: number; mode?: string }) => {
   const q = new URLSearchParams()
   if (params?.status) q.set('status', params.status)
+  if (params?.mode) q.set('mode', params.mode)
   if (params?.limit !== undefined) q.set('limit', String(params.limit))
   if (params?.offset !== undefined) q.set('offset', String(params.offset))
   const qs = q.toString()
@@ -84,7 +86,8 @@ export const testCredentials      = () => post<CredentialsTestResponse>('/settin
 export const fetchTradingMode     = () => get<{ mode: string }>('/trading-mode')
 
 // Live signals with real-time prices
-export const fetchOpenSignalsLive = () => get<{ total: number; data: Signal[] }>('/signals/open/live')
+export const fetchOpenSignalsLive = (mode?: string) =>
+  get<{ total: number; data: Signal[] }>(mode ? `/signals/open/live?mode=${mode}` : '/signals/open/live')
 
 // Manual sell actions
 export const sellSignal      = (id: number, reason: string) =>
@@ -92,7 +95,13 @@ export const sellSignal      = (id: number, reason: string) =>
 export const sellSignalPaper = (id: number, reason: string) =>
   post<SellResponse>(`/signals/${id}/sell-paper`, { reason })
 
-// Mode switching
+// Mode switching (legacy)
 export const setTradingMode = (mode: string) =>
   post<{ mode: string; message: string }>('/bot/mode', { mode })
+
+// Independent mode toggles
+export const togglePaperMode = (enabled: boolean) =>
+  post<{ mode: string; enabled: boolean }>('/bot/paper', { enabled })
+export const toggleLiveMode = (enabled: boolean) =>
+  post<{ mode: string; enabled: boolean }>('/bot/live', { enabled })
 

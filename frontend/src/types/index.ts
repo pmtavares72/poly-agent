@@ -106,6 +106,8 @@ export interface BotStatus {
   last_error: string | null
   scan_count: number
   trading_mode: string
+  paper_enabled: number
+  live_enabled: number
 }
 
 export interface SellResponse {

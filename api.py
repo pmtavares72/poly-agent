@@ -231,12 +231,34 @@ class ModeUpdate(BaseModel):
 
 @app.post("/bot/mode")
 def set_trading_mode(req: ModeUpdate):
-    """Switch trading mode (paper/live). Stored in DB, read by agent.py on each scan."""
+    """Legacy mode switch — kept for compat. Use /bot/paper and /bot/live instead."""
     if req.mode not in ("paper", "live"):
         raise HTTPException(status_code=400, detail="Mode must be 'paper' or 'live'")
+    conn = get_conn()
+    conn.execute("UPDATE bot_status SET trading_mode=? WHERE id=1", (req.mode,))
+    conn.commit()
+    conn.close()
+    return {"mode": req.mode, "message": f"Trading mode set to {req.mode.upper()}"}
 
-    # If switching to live, verify credentials are configured
-    if req.mode == "live":
+
+class ModeToggle(BaseModel):
+    enabled: bool
+
+
+@app.post("/bot/paper")
+def toggle_paper(req: ModeToggle):
+    """Enable/disable paper trading mode independently."""
+    conn = get_conn()
+    conn.execute("UPDATE bot_status SET paper_enabled=? WHERE id=1", (int(req.enabled),))
+    conn.commit()
+    conn.close()
+    return {"mode": "paper", "enabled": req.enabled}
+
+
+@app.post("/bot/live")
+def toggle_live(req: ModeToggle):
+    """Enable/disable live trading mode independently."""
+    if req.enabled:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("SELECT private_key, funder_address, api_key FROM credentials WHERE id=1")
@@ -245,14 +267,13 @@ def set_trading_mode(req: ModeUpdate):
         if not cred_row or not cred_row["private_key"] or not cred_row["api_key"]:
             raise HTTPException(
                 status_code=400,
-                detail="Cannot switch to live mode — configure credentials in Settings first"
+                detail="Cannot enable live mode — configure credentials in Settings first"
             )
-
     conn = get_conn()
-    conn.execute("UPDATE bot_status SET trading_mode=? WHERE id=1", (req.mode,))
+    conn.execute("UPDATE bot_status SET live_enabled=? WHERE id=1", (int(req.enabled),))
     conn.commit()
     conn.close()
-    return {"mode": req.mode, "message": f"Trading mode set to {req.mode.upper()}"}
+    return {"mode": "live", "enabled": req.enabled}
 
 
 @app.post("/bot/scan-now")
@@ -267,10 +288,10 @@ def scan_now():
     if not row or not row["enabled"]:
         raise HTTPException(status_code=400, detail="Bot is disabled — enable it first")
 
-    current_mode = _get_db_trading_mode()
+    # Scan now runs without --mode so agent.py reads paper_enabled/live_enabled from DB
     try:
         proc = subprocess.Popen(
-            [sys.executable, AGENT_SCRIPT, "--mode", current_mode, "--force"],
+            [sys.executable, AGENT_SCRIPT, "--force"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -278,8 +299,7 @@ def scan_now():
         return {
             "triggered": True,
             "pid": proc.pid,
-            "mode": current_mode,
-            "message": f"Scan launched in {current_mode} mode (pid={proc.pid}). Results appear in ~2-5 min.",
+            "message": f"Scan launched (pid={proc.pid}). Runs enabled modes. Results in ~2-5 min.",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to launch agent: {e}")
@@ -292,25 +312,29 @@ def scan_now():
 @app.get("/signals")
 def get_signals(
     status: Optional[str] = Query(None, description="open | resolved | expired"),
+    mode: Optional[str] = Query(None, description="Filter by mode: paper | live"),
     limit: int = Query(100, le=500),
     offset: int = Query(0),
 ):
     conn = get_conn()
     cur = conn.cursor()
+    where_parts = ["1=1"]
+    params_list: list = []
     if status in ("open", "resolved", "expired"):
-        cur.execute(
-            "SELECT * FROM signals WHERE status=? ORDER BY detected_at DESC LIMIT ? OFFSET ?",
-            (status, limit, offset),
-        )
-    else:
-        cur.execute(
-            "SELECT * FROM signals ORDER BY detected_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        )
+        where_parts.append("status=?")
+        params_list.append(status)
+    if mode in ("paper", "live"):
+        where_parts.append("mode=?")
+        params_list.append(mode)
+    where_sql = " AND ".join(where_parts)
+    cur.execute(
+        f"SELECT * FROM signals WHERE {where_sql} ORDER BY detected_at DESC LIMIT ? OFFSET ?",
+        (*params_list, limit, offset),
+    )
     data = rows(cur)
     cur.execute(
-        "SELECT COUNT(*) FROM signals" + (" WHERE status=?" if status else ""),
-        (status,) if status else (),
+        f"SELECT COUNT(*) FROM signals WHERE {where_sql}",
+        tuple(params_list),
     )
     total = cur.fetchone()[0]
     conn.close()
@@ -318,13 +342,21 @@ def get_signals(
 
 
 @app.get("/signals/open")
-def get_open_signals(limit: int = Query(100, le=500), offset: int = Query(0)):
-    return get_signals(status="open", limit=limit, offset=offset)
+def get_open_signals(
+    mode: Optional[str] = Query(None, description="Filter by mode: paper | live"),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0),
+):
+    return get_signals(status="open", mode=mode, limit=limit, offset=offset)
 
 
 @app.get("/signals/resolved")
-def get_resolved_signals(limit: int = Query(100, le=500), offset: int = Query(0)):
-    return get_signals(status="resolved", limit=limit, offset=offset)
+def get_resolved_signals(
+    mode: Optional[str] = Query(None, description="Filter by mode: paper | live"),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0),
+):
+    return get_signals(status="resolved", mode=mode, limit=limit, offset=offset)
 
 
 @app.get("/signals/{signal_id}")
@@ -391,11 +423,14 @@ def _compute_pnl_scenarios(signal: dict, current_price: float) -> dict:
 
 
 @app.get("/signals/open/live")
-def get_open_signals_live():
+def get_open_signals_live(mode: Optional[str] = Query(None, description="Filter by mode: paper | live")):
     """Open signals enriched with real-time prices and P&L calculations."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM signals WHERE status='open' ORDER BY detected_at DESC")
+    if mode in ("paper", "live"):
+        cur.execute("SELECT * FROM signals WHERE status='open' AND mode=? ORDER BY detected_at DESC", (mode,))
+    else:
+        cur.execute("SELECT * FROM signals WHERE status='open' ORDER BY detected_at DESC")
     signals = [dict(r) for r in cur.fetchall()]
     conn.close()
 
@@ -809,16 +844,16 @@ def strategy_scan_now(slug: str):
     if not row["enabled"]:
         raise HTTPException(status_code=400, detail=f"Strategy '{slug}' is disabled — enable it first")
 
-    current_mode = _get_db_trading_mode()
+    # No --mode flag — agent.py reads paper_enabled/live_enabled from DB
     try:
         proc = subprocess.Popen(
-            [sys.executable, AGENT_SCRIPT, "--mode", current_mode, "--strategy", slug, "--force"],
+            [sys.executable, AGENT_SCRIPT, "--strategy", slug, "--force"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        return {"triggered": True, "pid": proc.pid, "strategy": slug, "mode": current_mode,
-                "message": f"Scan launched in {current_mode} mode (pid={proc.pid})"}
+        return {"triggered": True, "pid": proc.pid, "strategy": slug,
+                "message": f"Scan launched (pid={proc.pid}). Runs enabled modes."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to launch scan: {e}")
 

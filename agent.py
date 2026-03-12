@@ -151,7 +151,9 @@ def init_db(db_path: str = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.d
             next_scan_at    TEXT,
             last_error      TEXT,
             scan_count      INTEGER DEFAULT 0,
-            trading_mode    TEXT DEFAULT 'paper'  -- paper | live (controlled from UI)
+            trading_mode    TEXT DEFAULT 'paper',  -- legacy (kept for compat)
+            paper_enabled   INTEGER DEFAULT 1,     -- 1=cron runs paper mode
+            live_enabled    INTEGER DEFAULT 0      -- 1=cron runs live mode
         );
         INSERT OR IGNORE INTO bot_status (id) VALUES (1);
 
@@ -295,6 +297,8 @@ def init_db(db_path: str = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.d
         ("config", "max_capital_deployed_pct", "REAL DEFAULT 0.50"),
         ("signals", "mode", "TEXT DEFAULT 'paper'"),
         ("signals", "order_id", "TEXT"),
+        ("bot_status", "paper_enabled", "INTEGER DEFAULT 1"),
+        ("bot_status", "live_enabled", "INTEGER DEFAULT 0"),
     ]
     for table, column, definition in migrations:
         try:
@@ -1478,7 +1482,7 @@ if __name__ == "__main__":
             console.print(f"[red]✗ Cancel failed: {e}[/red]")
         exit(0)
 
-    mode = cli_params.get("mode", "backtest")
+    cli_mode = cli_params.get("mode", "backtest")
 
     strategy_slug = cli_params.get("strategy", "bond_hunter")
 
@@ -1486,19 +1490,32 @@ if __name__ == "__main__":
     conn_init = init_db()
     conn_init.row_factory = sqlite3.Row
 
-    # Mode resolution: CLI --mode > DB bot_status.trading_mode > ENV POLYAGENT_MODE > 'paper'
-    if mode == "backtest":
-        # CLI didn't specify a mode — read from DB first, then env var
+    # Determine which modes to run
+    # If CLI specifies --mode paper or --mode live, run ONLY that mode
+    # If no --mode (cron), read paper_enabled/live_enabled from DB and run each that's ON
+    if cli_mode in ("paper", "live"):
+        modes_to_run = [cli_mode]
+    elif cli_mode == "backtest":
+        # Cron invocation (no --mode) — check which modes are enabled in DB
         try:
             cur_mode = conn_init.cursor()
-            cur_mode.execute("SELECT trading_mode FROM bot_status WHERE id=1")
+            cur_mode.execute("SELECT paper_enabled, live_enabled FROM bot_status WHERE id=1")
             row_mode = cur_mode.fetchone()
-            db_mode = row_mode["trading_mode"] if row_mode and row_mode["trading_mode"] else None
+            modes_to_run = []
+            if row_mode:
+                if row_mode["paper_enabled"]:
+                    modes_to_run.append("paper")
+                if row_mode["live_enabled"]:
+                    modes_to_run.append("live")
+            if not modes_to_run:
+                # Fallback: if both are off but bot is enabled, default to paper
+                modes_to_run = ["paper"]
         except Exception:
-            db_mode = None
-        mode = db_mode or os.environ.get("POLYAGENT_MODE", "paper")
+            modes_to_run = [os.environ.get("POLYAGENT_MODE", "paper")]
+    else:
+        modes_to_run = []
 
-    if mode in ("paper", "live"):
+    if modes_to_run:
         # Verificar si el bot está habilitado (a menos que se fuerce con --force)
         if not check_bot_enabled(conn_init) and not cli_params.get("force"):
             console.print("[yellow]Bot está PARADO (disabled en config). "
@@ -1506,16 +1523,12 @@ if __name__ == "__main__":
             conn_init.close()
             exit(0)
 
-        # Mezclar: CLI tiene precedencia sobre BD, BD tiene precedencia sobre defaults
-        db_params = load_config_from_db(conn_init)
-        params = {**db_params, **{k: v for k, v in cli_params.items() if k != "mode"}}
-        params["mode"] = mode
-
-        # For live mode, override capital from env if set
-        if mode == "live":
-            live_capital = os.environ.get("POLYAGENT_LIVE_CAPITAL")
-            if live_capital:
-                params["initial_capital"] = float(live_capital)
+        # Get strategy instance
+        strategy = get_strategy(strategy_slug)
+        if not strategy:
+            console.print(f"[red]Unknown strategy: {strategy_slug}[/red]")
+            conn_init.close()
+            exit(1)
 
         # Registrar inicio de scan
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -1525,30 +1538,36 @@ if __name__ == "__main__":
             last_error=None,
         )
 
-        # Get strategy instance
-        strategy = get_strategy(strategy_slug)
-        if not strategy:
-            console.print(f"[red]Unknown strategy: {strategy_slug}[/red]")
-            conn_init.close()
-            exit(1)
+        # Run each enabled mode sequentially
+        for mode in modes_to_run:
+            db_params = load_config_from_db(conn_init)
+            params = {**db_params, **{k: v for k, v in cli_params.items() if k != "mode"}}
+            params["mode"] = mode
 
-        mode_label = "LIVE TRADING 💰" if mode == "live" else "PAPER TRADING"
-        color = "bold red" if mode == "live" else "bold green"
-        console.rule(f"[{color}]POLYMARKET {strategy.name.upper()} — {mode_label}[/{color}]")
-        console.print(f"  Capital: [bold]${params['initial_capital']:.2f}[/bold]  |  "
-                      f"Strategy: [bold]{strategy.name}[/bold]  |  "
-                      f"Mode: [bold]{mode.upper()}[/bold]\n")
+            # For live mode, override capital from env if set
+            if mode == "live":
+                live_capital = os.environ.get("POLYAGENT_LIVE_CAPITAL")
+                if live_capital:
+                    params["initial_capital"] = float(live_capital)
 
-        try:
-            strategy.run(conn_init, params)
-            # Incrementar contador de scans
-            conn_init.execute("UPDATE bot_status SET scan_count = scan_count + 1 WHERE id=1")
-            conn_init.commit()
-            conn_init.close()
-        except Exception as e:
-            update_bot_status(conn_init, last_error=str(e))
-            conn_init.close()
-            raise
+            mode_label = "LIVE TRADING 💰" if mode == "live" else "PAPER TRADING"
+            color = "bold red" if mode == "live" else "bold green"
+            console.rule(f"[{color}]POLYMARKET {strategy.name.upper()} — {mode_label}[/{color}]")
+            console.print(f"  Capital: [bold]${params['initial_capital']:.2f}[/bold]  |  "
+                          f"Strategy: [bold]{strategy.name}[/bold]  |  "
+                          f"Mode: [bold]{mode.upper()}[/bold]\n")
+
+            try:
+                strategy.run(conn_init, params)
+            except Exception as e:
+                console.print(f"[red]Error in {mode} mode: {e}[/red]")
+                update_bot_status(conn_init, last_error=f"{mode}: {str(e)}")
+                # Continue with next mode even if one fails
+
+        # Incrementar contador de scans
+        conn_init.execute("UPDATE bot_status SET scan_count = scan_count + 1 WHERE id=1")
+        conn_init.commit()
+        conn_init.close()
 
     else:
         db_params = load_config_from_db(conn_init)

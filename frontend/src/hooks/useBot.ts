@@ -1,7 +1,7 @@
 'use client'
 import { useState } from 'react'
 import useSWR from 'swr'
-import { fetchBotStatus, enableBot, disableBot, scanNow, setTradingMode } from '@/lib/api'
+import { fetchBotStatus, enableBot, disableBot, scanNow, setTradingMode, togglePaperMode, toggleLiveMode } from '@/lib/api'
 
 export function useBot() {
   const { data, error, isLoading, mutate } = useSWR('/bot', fetchBotStatus, {
@@ -55,6 +55,32 @@ export function useBot() {
     }
   }
 
+  async function togglePaper(enabled: boolean) {
+    setActionLoading(true)
+    setActionError(null)
+    try {
+      await togglePaperMode(enabled)
+      await mutate()
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Unknown error')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  async function toggleLive(enabled: boolean) {
+    setActionLoading(true)
+    setActionError(null)
+    try {
+      await toggleLiveMode(enabled)
+      await mutate()
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Unknown error')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
   return {
     bot: data,
     error,
@@ -64,5 +90,7 @@ export function useBot() {
     toggle,
     triggerScan,
     switchMode,
+    togglePaper,
+    toggleLive,
   }
 }

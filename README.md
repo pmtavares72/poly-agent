@@ -43,7 +43,7 @@ Bot de trading automatizado para mercados de predicción de Polymarket. Arquitec
 | Dashboard | Stats completos | Stats completos + order IDs reales |
 | Resolución de exits | Sintética (al resolver mercado) | Tokens se redimen automáticamente a $1.00 |
 
-**El modo por defecto es `paper`.** Activa `live` desde el toggle en el dashboard o en el `.env`.
+**Paper y Live son modos independientes.** Cada uno tiene su toggle ON/OFF en el dashboard. Ambos pueden correr simultáneamente con P&L completamente separada. El dashboard tiene tabs Paper/Live para ver cada uno por separado.
 
 ---
 
@@ -380,9 +380,12 @@ Botones de acción (requieren confirmación):
 
 ### Aislamiento de Modos
 
-- Paper y live se almacenan con columnas separadas (`mode = 'paper'` vs `mode = 'live'`).
+- Paper y live son **modos independientes** con toggles ON/OFF separados en el dashboard.
+- Se almacenan con columnas separadas (`mode = 'paper'` vs `mode = 'live'`).
 - El modo paper NUNCA toca el CLOB API para órdenes.
-- Puedes ejecutar paper y live en paralelo para comparar resultados.
+- **Ambos corren en paralelo:** el cron ejecuta primero paper (si ON), luego live (si ON).
+- El dashboard tiene tabs Paper / Live para ver KPIs, chart y señales de cada modo por separado.
+- Stats y P&L filtradas por modo: `GET /stats?mode=paper`, `GET /stats?mode=live`.
 
 ---
 
@@ -392,7 +395,7 @@ Botones de acción (requieren confirmación):
 
 ```
 1. Cron dispara: python3 agent.py
-   (el modo paper/live se lee de bot_status.trading_mode en la BD)
+   (lee paper_enabled/live_enabled de bot_status — ejecuta cada modo activo)
 
 2. FASE DE RISK MANAGEMENT (NUEVO — se ejecuta PRIMERO)
    ├─ Para cada señal abierta:
@@ -612,12 +615,14 @@ sqlite3 data/polyagent.db < migrations.sql
 | GET | `/config` | Config Bond Hunter |
 | POST | `/config` | Update config |
 | GET/POST | `/bot`, `/bot/enable`, `/bot/disable` | Control del bot |
-| POST | `/bot/scan-now` | Scan inmediato |
-| POST | `/bot/mode` | Cambiar modo paper/live (NUEVO) |
-| GET | `/signals`, `/signals/open` | Señales |
-| GET | `/signals/open/live` | Señales abiertas con precios en tiempo real + P&L (NUEVO) |
-| POST | `/signals/{id}/sell` | Venta manual live (NUEVO) |
-| POST | `/signals/{id}/sell-paper` | Venta manual paper (NUEVO) |
+| POST | `/bot/scan-now` | Scan inmediato (ejecuta modos activos) |
+| POST | `/bot/paper` | Toggle paper ON/OFF `{ "enabled": true }` |
+| POST | `/bot/live` | Toggle live ON/OFF `{ "enabled": true }` (valida credentials) |
+| POST | `/bot/mode` | Legacy: cambiar modo (compat) |
+| GET | `/signals`, `/signals/open` | Señales (acepta `?mode=paper\|live`) |
+| GET | `/signals/open/live` | Señales abiertas con precios en tiempo real + P&L (acepta `?mode=`) |
+| POST | `/signals/{id}/sell` | Venta manual live |
+| POST | `/signals/{id}/sell-paper` | Venta manual paper |
 | GET | `/stats` | KPIs agregados (acepta `?mode=paper\|live`) |
 
 ### Settings / Credentials
@@ -646,7 +651,7 @@ Accede en `http://localhost:3000` después de ejecutar `start.sh`.
 
 | Página | Descripción |
 |--------|-------------|
-| `/dashboard` | KPIs, gráfico P&L, señales activas con precios en tiempo real, control del bot, toggle PAPER/LIVE |
+| `/dashboard` | Tabs Paper/Live con KPIs, gráfico P&L y señales separadas. Toggles independientes Paper ON/OFF y Live ON/OFF. |
 | `/strategies` | Cards de configuración (Bond Hunter con risk management, IFNL-Lite) |
 | `/settings` | Configurar credenciales de Polymarket (private key, auto-derive funder + API creds) |
 | `/logs` | Historial de ejecución de scans |
@@ -795,33 +800,23 @@ python3 scripts/set_allowances.py
 3. O mata todo: `bash stop.sh`
 4. Verifica en polymarket.com que tus posiciones estén correctas
 
-### Cambiar entre paper y live
+### Controlar Paper y Live
 
-**Opción A — Dashboard (recomendado, sin reinicio):**
+Paper y Live son **modos independientes** que corren en paralelo. Cada uno tiene su toggle ON/OFF en el dashboard.
 
-En el dashboard, junto al control del bot, hay un toggle **PAPER / LIVE**. Click para cambiar. Si cambias a LIVE, se pide confirmación.
+**Dashboard (recomendado):**
+- Toggle **PAPER ON/OFF** — activa/desactiva el scan en modo paper
+- Toggle **LIVE ON/OFF** — activa/desactiva el scan en modo live (requiere confirmación para activar)
+- Ambos pueden estar ON simultáneamente — el cron ejecuta primero paper, luego live
+- Tabs **Paper / Live** en el dashboard para ver KPIs, chart y señales de cada modo por separado
 
-El modo se guarda en la BD (`bot_status.trading_mode`). El siguiente scan del cron usa el nuevo modo automáticamente — **no requiere reinicio**.
+**El cron lee `paper_enabled` y `live_enabled` de `bot_status` en cada ejecución.** No hay que reiniciar nada.
 
-**Opción B — Variable de entorno (legacy):**
+**Fallback (sin UI):**
+- CLI: `python3 agent.py --mode paper` o `--mode live` (fuerza un solo modo)
+- ENV: `POLYAGENT_MODE=paper` (solo si no hay flags en DB)
 
-Edita `.env`:
-```env
-POLYAGENT_MODE=paper   # o live
-```
-
-Luego reinicia:
-```bash
-bash stop.sh && bash start.sh
-```
-
-**Prioridad de resolución del modo:**
-1. CLI `--mode` (override manual para testing)
-2. BD `bot_status.trading_mode` (toggle del dashboard)
-3. ENV `POLYAGENT_MODE` (fallback para deploy sin UI)
-4. Default: `paper`
-
-Las señales paper y live se almacenan por separado (columna `mode`) — cambiar de modo no afecta datos históricos. Stats y P&L se pueden filtrar por modo con `GET /stats?mode=paper`.
+Las señales paper y live se almacenan por separado (columna `mode`) — activar/desactivar un modo no afecta datos del otro. Stats, señales y P&L se filtran automáticamente en el dashboard según el tab seleccionado.
 
 ---
 

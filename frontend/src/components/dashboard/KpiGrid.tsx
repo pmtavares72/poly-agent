@@ -4,10 +4,12 @@ import { formatUSDC, formatPct } from '@/lib/format'
 
 interface KpiGridProps {
   stats: Stats
+  mode?: 'paper' | 'live'
 }
 
-export function KpiGrid({ stats }: KpiGridProps) {
-  const capital = 500 + stats.total_pnl
+export function KpiGrid({ stats, mode }: KpiGridProps) {
+  const capital = stats.base_capital + stats.total_pnl
+  const modeLabel = mode === 'live' ? 'Live' : 'Paper'
 
   return (
     <div className="kpi-grid" style={{
@@ -18,19 +20,19 @@ export function KpiGrid({ stats }: KpiGridProps) {
     }}>
       <KpiCard
         icon="◈"
-        label="Total Capital"
+        label={`${modeLabel} Capital`}
         value={formatUSDC(capital, false)}
-        delta={`↑ ${formatUSDC(stats.total_pnl)} today`}
+        delta={`${stats.total_pnl >= 0 ? '↑' : '↓'} ${formatUSDC(stats.total_pnl)}`}
         deltaPositive={stats.total_pnl >= 0}
-        accent="green"
+        accent={mode === 'live' ? 'red' : 'green'}
       />
       <KpiCard
         icon="◎"
-        label="PnL Today"
+        label={`${modeLabel} PnL`}
         value={formatUSDC(stats.total_pnl)}
-        delta={`↑ ${formatPct((stats.total_pnl / 500) * 100)}`}
+        delta={`${stats.total_pnl >= 0 ? '↑' : '↓'} ${formatPct((stats.total_pnl / stats.base_capital) * 100)}`}
         deltaPositive={stats.total_pnl >= 0}
-        accent="green"
+        accent={mode === 'live' ? 'red' : 'green'}
       />
       <KpiCard
         icon="⬡"

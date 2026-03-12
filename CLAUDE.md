@@ -181,7 +181,9 @@ mid_at_trade, mid_5m_after, mid_30m_after, mid_2h_after
 #### `bot_status` (singleton, id=1)
 ```sql
 id, enabled, pid, last_scan_at, next_scan_at, last_error, scan_count,
-trading_mode TEXT DEFAULT 'paper'  -- Migration 007: UI-controlled paper/live
+trading_mode TEXT DEFAULT 'paper',  -- Migration 007: legacy compat
+paper_enabled INTEGER DEFAULT 1,    -- Migration 008: independent paper toggle
+live_enabled INTEGER DEFAULT 0      -- Migration 008: independent live toggle
 ```
 
 #### `scan_log`, `runs`, `trades`
@@ -237,11 +239,13 @@ FastAPI on port 8765. CORS: `allow_origins=["*"]`.
 | GET | `/bot` | Bot status + pid_alive |
 | POST | `/bot/enable` | Enable bot |
 | POST | `/bot/disable` | Disable bot |
-| POST | `/bot/scan-now` | Trigger Bond Hunter scan |
-| **POST** | **`/bot/mode`** | **Switch paper/live mode** |
-| GET | `/signals` | Bond Hunter signals |
-| GET | `/signals/open` | Open signals |
-| **GET** | **`/signals/open/live`** | **Open signals + real-time prices + P&L** |
+| POST | `/bot/scan-now` | Trigger scan (runs enabled modes) |
+| **POST** | **`/bot/paper`** | **Toggle paper ON/OFF `{ "enabled": true }` (Mig 008)** |
+| **POST** | **`/bot/live`** | **Toggle live ON/OFF `{ "enabled": true }` (Mig 008)** |
+| POST | `/bot/mode` | Legacy mode switch (compat) |
+| GET | `/signals` | Bond Hunter signals (accepts `?mode=paper\|live`) |
+| GET | `/signals/open` | Open signals (accepts `?mode=`) |
+| **GET** | **`/signals/open/live`** | **Open signals + real-time prices + P&L (accepts `?mode=`)** |
 | GET | `/signals/{id}` | Single signal |
 | **POST** | **`/signals/{id}/sell`** | **Manual sell (live mode)** |
 | **POST** | **`/signals/{id}/sell-paper`** | **Manual sell (paper mode)** |
@@ -378,7 +382,7 @@ rewrites() {
 - **`IfnlLiteCard`** — IFNL-Lite config (5 sections: market selection, signal thresholds, position sizing, exit rules, IFS params), start/stop toggle, wallet stats
 - **`IfnlActivityPanel`** — Live engine metrics grid (in IfnlDashboard): trades captured, wallets seen, markets monitored, WebSocket status, book states, flow entries, signals generated. Shows "LIVE"/"OFFLINE" indicator + staleness detection.
 - **`BotControl`** — Start/stop bot, Scan Now button
-- **`ModeToggle`** — Paper/Live mode switch with confirmation for live mode
+- **`ModeToggle`** — Dual toggles: Paper ON/OFF + Live ON/OFF (independent, with confirmation for live)
 - **`SignalCard`** — Open signal with real-time price, P&L scenarios, Take Profit / Sell buttons
 - **`KpiGrid`** / **`PnlChart`** / **`ActiveSignals`** / **`RecentSignalsTable`**
 - **`AppShell`** / **`Sidebar`** / **`TickerTape`**
@@ -386,11 +390,11 @@ rewrites() {
 ### Hooks (all SWR-based)
 
 ```typescript
-useStats()           // 30s refresh → /stats
-useSignals(params)   // 30s refresh → /signals
+useStats(mode?)      // 30s refresh → /stats?mode= (filtered by paper/live tab)
+useSignals(params)   // 30s refresh → /signals?mode= (accepts mode param)
 useOpenSignals()     // 30s refresh → /signals/open
-useOpenSignalsLive() // 15s refresh → /signals/open/live (real-time prices + P&L)
-useBot()             // 5s refresh  → /bot + switchMode()
+useOpenSignalsLive(mode?) // 15s refresh → /signals/open/live?mode= (real-time prices + P&L)
+useBot()             // 5s refresh  → /bot + togglePaper() + toggleLive()
 useConfig()          // → /config + saveConfig()
 useStrategies()      // 30s refresh → /strategies
 useStrategy(slug)    // 30s refresh → /strategies/{slug}
@@ -411,7 +415,7 @@ useAuth()            // localStorage auth check
 2. Init DB: `python3 agent.py --mode paper --force` + apply `migrations.sql`
 3. Start API: `uvicorn api:app --host 0.0.0.0 --port 8765` (background)
 4. `npm install && npm run build && npm start --port 3000` (background)
-5. Add cron: `*/15 * * * * python3 agent.py` (mode read from DB)
+5. Add cron: `*/15 * * * * python3 agent.py` (reads paper_enabled/live_enabled from DB, runs each active mode)
 6. Auto-start IFNL-Lite runner if `enabled=1` in DB (PID saved to `logs/ifnl_lite.pid`)
 
 ### Environment variables
