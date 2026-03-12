@@ -35,8 +35,8 @@ class BaseStrategy(ABC):
         ...
 
     @abstractmethod
-    def get_stats(self, conn: sqlite3.Connection) -> dict:
-        """Return strategy-specific stats."""
+    def get_stats(self, conn: sqlite3.Connection, mode: str | None = None) -> dict:
+        """Return strategy-specific stats. Optional mode filter (paper/live)."""
         ...
 
     @abstractmethod

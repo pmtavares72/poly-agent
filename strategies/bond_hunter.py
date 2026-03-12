@@ -49,12 +49,21 @@ class BondHunterStrategy(BaseStrategy):
             "max_hours_to_close": 168.0,     # up to 7 days
             "min_liquidity_usdc": 300.0,
             "kelly_fraction": 0.35,
-            "max_position_pct": 0.20,        # max 20% of capital per trade
-            "max_capital_deployed_pct": 0.70, # deploy up to 70%
-            "max_per_market_pct": 0.20,      # max exposure per single market
+            "max_position_pct": 0.12,        # max 12% of capital per trade (was 20%)
+            "max_capital_deployed_pct": 0.50, # deploy up to 50% (was 70%)
+            "max_per_market_pct": 0.12,      # max exposure per single market
             "min_unique_traders": 10,         # skip thinly traded markets
             "fee_rate": 0.005,
             "scan_interval_min": 15,
+            # Risk management
+            "stop_loss_enabled": True,
+            "stop_loss_multiplier": 2.0,      # stop = entry - (mult × expected_profit)
+            "trailing_stop_enabled": True,
+            "trailing_stop_activation": 0.01, # activate when +1 cent profit
+            "trailing_stop_distance": 0.05,   # trail 5 cents below highest
+            "time_exit_enabled": True,
+            "time_exit_hours": 2.0,           # sell if <2h to close and losing
+            "order_fill_timeout_min": 30,     # cancel unfilled orders after 30 min
         }
 
     def run(self, conn: sqlite3.Connection, config: dict):
@@ -89,30 +98,45 @@ class BondHunterStrategy(BaseStrategy):
         total = cur.fetchone()[0]
         return {"total": total, "limit": limit, "offset": offset, "data": data}
 
-    def get_stats(self, conn: sqlite3.Connection) -> dict:
+    def get_stats(self, conn: sqlite3.Connection, mode: str | None = None) -> dict:
         cur = conn.cursor()
+
+        # Build mode filter clause
+        mode_filter = ""
+        mode_params: tuple = ()
+        if mode:
+            mode_filter = " AND mode=?"
+            mode_params = (mode,)
 
         def scalar(sql, params=()):
             cur.execute(sql, params)
             v = cur.fetchone()[0]
             return v or 0
 
-        total = scalar("SELECT COUNT(*) FROM signals")
-        open_c = scalar("SELECT COUNT(*) FROM signals WHERE status='open'")
-        resolved_c = scalar("SELECT COUNT(*) FROM signals WHERE status='resolved'")
-        wins = scalar("SELECT COUNT(*) FROM signals WHERE outcome='YES'")
-        losses = scalar("SELECT COUNT(*) FROM signals WHERE outcome='NO'")
-        total_pnl = scalar("SELECT SUM(pnl_usdc) FROM signals WHERE status='resolved'")
-        avg_spread = scalar("SELECT AVG(spread_entry_pct) FROM signals")
-        best = scalar("SELECT MAX(pnl_usdc) FROM signals WHERE status='resolved'")
-        worst = scalar("SELECT MIN(pnl_usdc) FROM signals WHERE status='resolved'")
-        total_fees = scalar("SELECT SUM(protocol_fee) FROM signals WHERE status='resolved'")
+        total = scalar(f"SELECT COUNT(*) FROM signals WHERE 1=1{mode_filter}", mode_params)
+        open_c = scalar(f"SELECT COUNT(*) FROM signals WHERE status='open'{mode_filter}", mode_params)
+        resolved_c = scalar(f"SELECT COUNT(*) FROM signals WHERE status='resolved'{mode_filter}", mode_params)
+        wins = scalar(f"SELECT COUNT(*) FROM signals WHERE outcome='YES'{mode_filter}", mode_params)
+        losses = scalar(f"SELECT COUNT(*) FROM signals WHERE outcome='NO'{mode_filter}", mode_params)
+        total_pnl = scalar(f"SELECT SUM(pnl_usdc) FROM signals WHERE status='resolved'{mode_filter}", mode_params)
+        avg_spread = scalar(f"SELECT AVG(spread_entry_pct) FROM signals WHERE 1=1{mode_filter}", mode_params)
+        best = scalar(f"SELECT MAX(pnl_usdc) FROM signals WHERE status='resolved'{mode_filter}", mode_params)
+        worst = scalar(f"SELECT MIN(pnl_usdc) FROM signals WHERE status='resolved'{mode_filter}", mode_params)
+        total_fees = scalar(f"SELECT SUM(protocol_fee) FROM signals WHERE status='resolved'{mode_filter}", mode_params)
 
-        cur.execute("""
+        # Exit reason counters
+        risk_exits = scalar(f"SELECT COUNT(*) FROM signals WHERE outcome='RISK_EXIT'{mode_filter}", mode_params)
+        stop_losses = scalar(f"SELECT COUNT(*) FROM signals WHERE exit_reason='stop_loss'{mode_filter}", mode_params)
+        trailing_stops = scalar(f"SELECT COUNT(*) FROM signals WHERE exit_reason='trailing_stop'{mode_filter}", mode_params)
+        time_exits = scalar(f"SELECT COUNT(*) FROM signals WHERE exit_reason='time_exit'{mode_filter}", mode_params)
+        manual_tps = scalar(f"SELECT COUNT(*) FROM signals WHERE exit_reason='manual_tp'{mode_filter}", mode_params)
+        manual_sells = scalar(f"SELECT COUNT(*) FROM signals WHERE exit_reason='manual_sell'{mode_filter}", mode_params)
+
+        cur.execute(f"""
             SELECT resolved_at, pnl_usdc FROM signals
-            WHERE status='resolved' AND resolved_at IS NOT NULL
+            WHERE status='resolved' AND resolved_at IS NOT NULL{mode_filter}
             ORDER BY resolved_at ASC
-        """)
+        """, mode_params)
         pnl_series = []
         cumulative = 0.0
         for r in cur.fetchall():
@@ -134,6 +158,12 @@ class BondHunterStrategy(BaseStrategy):
             "worst_trade": round(float(worst), 4),
             "total_fees": round(float(total_fees), 4),
             "pnl_series": pnl_series,
+            "risk_exits": risk_exits,
+            "stop_losses": stop_losses,
+            "trailing_stops": trailing_stops,
+            "time_exits": time_exits,
+            "manual_tps": manual_tps,
+            "manual_sells": manual_sells,
         }
 
 
@@ -538,6 +568,269 @@ def _auto_redeem(token_id: str, shares: float, question: str, logger) -> float:
 
 
 # ─────────────────────────────────────────────
+# RISK MANAGEMENT
+# ─────────────────────────────────────────────
+
+def _fetch_current_price(token_id: str) -> float | None:
+    """Fetch last trade price from CLOB. Returns None on error."""
+    try:
+        resp = requests.get(
+            CLOB_LAST_TRADE,
+            params={"token_id": token_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        price = float(data.get("price", 0))
+        return price if price > 0 else None
+    except Exception:
+        return None
+
+
+def _calculate_exit_pnl(shares: float, sell_price: float, position_usdc: float,
+                        protocol_fee: float, fee_rate: float = 0.005) -> float:
+    """Calculate P&L for an exit, including sell-side spread and fees."""
+    bid_price = sell_price - 0.005  # sell at bid (spread)
+    sell_fee = shares * bid_price * fee_rate
+    exit_value = shares * bid_price - sell_fee
+    return exit_value - position_usdc - protocol_fee
+
+
+def _execute_risk_exit(conn: sqlite3.Connection, signal: dict, current_price: float,
+                       reason: str, mode: str, logger) -> bool:
+    """
+    Execute a risk exit (stop-loss, trailing stop, or time exit).
+    Paper: just update DB. Live: sell via CLOB + update DB.
+    Returns True on success.
+    """
+    sig_id = signal["id"]
+    token_id = signal["token_id"]
+    shares = signal["shares"]
+    position_usdc = signal["position_usdc"]
+    protocol_fee = signal["protocol_fee"] or 0
+    question = signal["question"] or ""
+    fee_rate = 0.005
+
+    pnl = _calculate_exit_pnl(shares, current_price, position_usdc, protocol_fee, fee_rate)
+    pnl_pct = (pnl / position_usdc * 100) if position_usdc else 0
+
+    # Live mode: execute real sell
+    if mode == "live":
+        try:
+            from clob_client import sell_position
+            sell_price_order = round(current_price - 0.01, 2)  # below market to ensure fill
+            sell_size = round(shares, 2)
+            if sell_size < 1.0:
+                logger.info(f"Risk exit skip (too small): {sell_size} shares for #{sig_id}")
+                return False
+            response = sell_position(token_id=token_id, size=sell_size, price=sell_price_order)
+            order_id = response.get("orderID") or response.get("id") or "unknown"
+            logger.info(f"Risk exit SELL: #{sig_id} reason={reason} price={sell_price_order} order={order_id}")
+        except Exception as e:
+            logger.error(f"Risk exit SELL FAILED: #{sig_id} reason={reason} | {e}")
+            console.print(f"  [red]⚠ Risk exit sell failed for #{sig_id}: {e}[/red]")
+            return False
+
+    # Update DB
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn.execute("""
+        UPDATE signals SET
+            status='resolved', outcome='RISK_EXIT', exit_reason=?,
+            resolved_at=?, pnl_usdc=?, pnl_pct=?,
+            current_price=?, last_price_check=?
+        WHERE id=?
+    """, (reason, now_iso, pnl, pnl_pct, current_price, now_iso, sig_id))
+    conn.commit()
+
+    icon = {"stop_loss": "🛑", "trailing_stop": "📉", "time_exit": "⏰"}.get(reason, "⚠")
+    color = "red" if pnl < 0 else "yellow"
+    q_short = (question[:45] + "…") if len(question) > 45 else question
+    pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+    mode_tag = " [LIVE]" if mode == "live" else ""
+    console.print(f"  {icon}  [bold]{q_short}[/bold]  [{color}]{pnl_str}[/{color}]  ({reason}){mode_tag}")
+    logger.info(f"Risk exit #{sig_id}: {reason} | pnl=${pnl:.2f} | {question[:40]}")
+    return True
+
+
+def check_risk_exits(conn: sqlite3.Connection, config: dict, mode: str) -> int:
+    """
+    Check all open signals for automatic risk exits.
+    Runs BEFORE resolution and scanning.
+    Returns number of exits triggered.
+    """
+    import logging
+    logger = logging.getLogger("bond_hunter.risk")
+
+    defaults = BondHunterStrategy().default_config()
+    def cfg(key):
+        return config.get(key, defaults[key])
+
+    stop_loss_enabled = cfg("stop_loss_enabled")
+    trailing_enabled = cfg("trailing_stop_enabled")
+    trailing_activation = cfg("trailing_stop_activation")
+    trailing_distance = cfg("trailing_stop_distance")
+    time_exit_enabled = cfg("time_exit_enabled")
+    time_exit_hours = cfg("time_exit_hours")
+
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, token_id, question, closes_at, entry_price, ask_price,
+               position_usdc, shares, protocol_fee, mode,
+               stop_loss_price, highest_price_seen, trailing_stop_price
+        FROM signals WHERE status='open'
+    """)
+    open_signals = [dict(r) for r in cur.fetchall()]
+
+    if not open_signals:
+        return 0
+
+    console.print(f"\n[cyan]Checking {len(open_signals)} positions for risk exits...[/cyan]")
+    exits = 0
+
+    for sig in open_signals:
+        sig_mode = sig["mode"] or "paper"
+        token_id = sig["token_id"]
+
+        # Fetch current price
+        current_price = _fetch_current_price(token_id)
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+        if current_price is None:
+            continue
+
+        # Update current price in DB
+        now_iso = datetime.now(timezone.utc).isoformat()
+        entry_price = sig["ask_price"] or sig["entry_price"]
+        highest = sig["highest_price_seen"] or entry_price
+
+        # Update highest price seen
+        if current_price > highest:
+            highest = current_price
+
+        # Calculate trailing stop price
+        trail_price = None
+        if trailing_enabled and highest > entry_price + trailing_activation:
+            trail_price = highest - trailing_distance
+
+        conn.execute("""
+            UPDATE signals SET
+                current_price=?, last_price_check=?,
+                highest_price_seen=?, trailing_stop_price=?
+            WHERE id=?
+        """, (current_price, now_iso, highest, trail_price, sig["id"]))
+        conn.commit()
+
+        # Check hours to close
+        hours_to_close = None
+        closes_at_str = sig["closes_at"]
+        if closes_at_str:
+            try:
+                closes_dt = datetime.fromisoformat(closes_at_str.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                hours_to_close = (closes_dt - now).total_seconds() / 3600
+            except (ValueError, TypeError):
+                pass
+
+        # CHECK EXITS in priority order
+        exit_reason = None
+
+        # a. HARD STOP-LOSS
+        if stop_loss_enabled and sig["stop_loss_price"]:
+            if current_price <= sig["stop_loss_price"]:
+                exit_reason = "stop_loss"
+
+        # b. TRAILING STOP
+        if not exit_reason and trailing_enabled and trail_price:
+            if current_price <= trail_price:
+                exit_reason = "trailing_stop"
+
+        # c. TIME EXIT
+        if not exit_reason and time_exit_enabled and hours_to_close is not None:
+            if hours_to_close < time_exit_hours and current_price < entry_price:
+                exit_reason = "time_exit"
+
+        # Execute exit if triggered
+        if exit_reason:
+            if _execute_risk_exit(conn, sig, current_price, exit_reason, sig_mode, logger):
+                exits += 1
+
+    if exits > 0:
+        console.print(f"[yellow]  {exits} risk exit(s) triggered[/yellow]")
+
+    return exits
+
+
+def check_order_fills(conn: sqlite3.Connection, config: dict) -> int:
+    """
+    Check if live orders have been filled. Cancel unfilled orders after timeout.
+    Returns number of cancelled orders.
+    """
+    import logging
+    logger = logging.getLogger("bond_hunter.fills")
+
+    defaults = BondHunterStrategy().default_config()
+    timeout_min = config.get("order_fill_timeout_min", defaults["order_fill_timeout_min"])
+
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, order_id, token_id, question, detected_at
+        FROM signals
+        WHERE status='open' AND mode='live' AND order_id IS NOT NULL
+    """)
+    live_orders = [dict(r) for r in cur.fetchall()]
+
+    if not live_orders:
+        return 0
+
+    cancelled = 0
+    now = datetime.now(timezone.utc)
+
+    for sig in live_orders:
+        order_id = sig["order_id"]
+        if not order_id or order_id == "unknown":
+            continue
+
+        # Check age of order
+        try:
+            detected = datetime.fromisoformat(sig["detected_at"].replace("Z", "+00:00"))
+            age_min = (now - detected).total_seconds() / 60
+        except (ValueError, TypeError):
+            continue
+
+        if age_min < timeout_min:
+            continue  # Not timed out yet
+
+        # Check if order was filled
+        try:
+            from clob_client import get_order, cancel_order
+            order_data = get_order(order_id)
+            if order_data and order_data.get("status") == "MATCHED":
+                continue  # Order filled, all good
+
+            # Order not filled after timeout — cancel it
+            cancel_order(order_id)
+            conn.execute("UPDATE signals SET status='expired', exit_reason='unfilled' WHERE id=?",
+                         (sig["id"],))
+            conn.commit()
+            cancelled += 1
+            q_short = (sig["question"] or "")[:40]
+            logger.info(f"Cancelled unfilled order: #{sig['id']} order={order_id} | {q_short}")
+            console.print(f"  [yellow]✗ Cancelled unfilled order #{sig['id']}: {q_short}[/yellow]")
+        except Exception as e:
+            logger.warning(f"Could not check order {order_id}: {e}")
+
+    return cancelled
+
+
+def _calculate_stop_loss_price(ask_price: float, net_profit_pct: float,
+                               multiplier: float) -> float:
+    """Calculate stop-loss price: entry - (multiplier × expected_profit)."""
+    expected_profit = 1.0 - ask_price  # gross profit per share
+    stop_distance = multiplier * expected_profit
+    return round(ask_price - stop_distance, 4)
+
+
+# ─────────────────────────────────────────────
 # PAPER TRADING SCAN
 # ─────────────────────────────────────────────
 
@@ -575,12 +868,15 @@ def run_paper(conn: sqlite3.Connection, config: dict):
     conn.commit()
     scan_log_id = cur_log.lastrowid
 
-    # Resolve pending signals first
+    # Risk exits first (before resolution and scanning)
+    risk_exits = check_risk_exits(conn, config, "paper")
+
+    # Resolve pending signals
     resolved_count = resolve_pending_signals(conn)
 
-    # Check available capital
+    # Check available capital (paper only)
     cur_cap = conn.cursor()
-    cur_cap.execute("SELECT COALESCE(SUM(position_usdc),0), COUNT(*) FROM signals WHERE status='open'")
+    cur_cap.execute("SELECT COALESCE(SUM(position_usdc),0), COUNT(*) FROM signals WHERE status='open' AND mode='paper'")
     committed_usdc, open_count = cur_cap.fetchone()
     max_deployable = capital * max_capital_deployed_pct
     available_capital = max(0.0, max_deployable - committed_usdc)
@@ -719,14 +1015,18 @@ def run_paper(conn: sqlite3.Connection, config: dict):
         volume_24h = float(m.get("volume24hr") or 0)
         market_url = f"https://polymarket.com/event/{m.get('slug', '')}"
 
+        stop_loss_p = _calculate_stop_loss_price(
+            ask_price, net_profit_pct, cfg("stop_loss_multiplier")
+        ) if cfg("stop_loss_enabled") else None
+
         cur.execute("""
             INSERT INTO signals (
                 detected_at, token_id, question, market_url, closes_at,
                 hours_to_close, entry_price, ask_price, spread_entry_pct,
                 net_profit_pct, position_usdc, shares, protocol_fee,
                 breakeven_price, liquidity, volume_24h, wash_score, status,
-                mode
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                mode, stop_loss_price, highest_price_seen, current_price
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).isoformat(),
             token_id_yes, question, market_url,
@@ -734,18 +1034,19 @@ def run_paper(conn: sqlite3.Connection, config: dict):
             current_price, ask_price, spread,
             net_profit_pct, position_usdc, shares, protocol_fee,
             breakeven, liquidity, volume_24h, "ok", "open",
-            "paper"
+            "paper", stop_loss_p, current_price, current_price
         ))
         conn.commit()
         new_signals += 1
 
+        sl_tag = f"  sl=[dim]${stop_loss_p:.3f}[/dim]" if stop_loss_p else ""
         q_short = (question[:52] + "…") if len(question) > 52 else question.ljust(53)
         console.print(
             f"  🎯  [bold]{q_short}[/bold]  "
             f"[cyan]${current_price:.4f}[/cyan]  "
             f"[yellow]${position_usdc:.2f}[/yellow]  "
             f"closes in [white]{hours_to_close:.1f}h[/white]  "
-            f"net=[green]+{net_profit_pct*100:.2f}%[/green]"
+            f"net=[green]+{net_profit_pct*100:.2f}%[/green]{sl_tag}"
         )
 
     # Update scan_log
@@ -842,7 +1143,13 @@ def run_live(conn: sqlite3.Connection, config: dict):
     conn.commit()
     scan_log_id = cur_log.lastrowid
 
-    # Resolve pending signals first (same as paper — checks market resolution)
+    # Risk exits first (before resolution and scanning)
+    risk_exits = check_risk_exits(conn, config, "live")
+
+    # Check and cancel unfilled orders
+    cancelled_orders = check_order_fills(conn, config)
+
+    # Resolve pending signals (checks market resolution via Gamma API)
     resolved_count = resolve_pending_signals(conn)
 
     # Check daily P&L — stop if below limit
@@ -1028,14 +1335,18 @@ def run_live(conn: sqlite3.Connection, config: dict):
         volume_24h = float(m.get("volume24hr") or 0)
         market_url = f"https://polymarket.com/event/{m.get('slug', '')}"
 
+        stop_loss_p = _calculate_stop_loss_price(
+            order_price, net_profit_pct, cfg("stop_loss_multiplier")
+        ) if cfg("stop_loss_enabled") else None
+
         cur.execute("""
             INSERT INTO signals (
                 detected_at, token_id, question, market_url, closes_at,
                 hours_to_close, entry_price, ask_price, spread_entry_pct,
                 net_profit_pct, position_usdc, shares, protocol_fee,
                 breakeven_price, liquidity, volume_24h, wash_score, status,
-                mode, order_id
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                mode, order_id, stop_loss_price, highest_price_seen, current_price
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).isoformat(),
             token_id_yes, question, market_url,
@@ -1043,18 +1354,19 @@ def run_live(conn: sqlite3.Connection, config: dict):
             current_price, order_price, spread,
             net_profit_pct, position_usdc, order_size, protocol_fee,
             breakeven, liquidity, volume_24h, "ok", "open",
-            "live", str(order_id),
+            "live", str(order_id), stop_loss_p, current_price, current_price
         ))
         conn.commit()
         new_signals += 1
 
+        sl_tag = f"  sl=[dim]${stop_loss_p:.3f}[/dim]" if stop_loss_p else ""
         q_short = (question[:52] + "…") if len(question) > 52 else question.ljust(53)
         console.print(
             f"  🎯  [bold]{q_short}[/bold]  "
             f"[cyan]${order_price:.4f}[/cyan]  "
             f"[yellow]${position_usdc:.2f}[/yellow]  "
             f"closes in [white]{hours_to_close:.1f}h[/white]  "
-            f"net=[green]+{net_profit_pct*100:.2f}%[/green]  "
+            f"net=[green]+{net_profit_pct*100:.2f}%[/green]{sl_tag}  "
             f"[bold magenta]ORDER={order_id}[/bold magenta]"
         )
 

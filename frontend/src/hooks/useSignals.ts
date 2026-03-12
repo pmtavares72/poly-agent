@@ -1,6 +1,6 @@
 'use client'
 import useSWR from 'swr'
-import { fetchSignals, fetchOpenSignals } from '@/lib/api'
+import { fetchSignals, fetchOpenSignals, fetchOpenSignalsLive } from '@/lib/api'
 
 export function useSignals(params?: { status?: string; limit?: number; offset?: number }) {
   const key = `/signals?${JSON.stringify(params ?? {})}`
@@ -17,4 +17,12 @@ export function useOpenSignals() {
     revalidateOnFocus: true,
   })
   return { signals: data, error, isLoading }
+}
+
+export function useOpenSignalsLive() {
+  const { data, error, isLoading, mutate } = useSWR('/signals/open/live', fetchOpenSignalsLive, {
+    refreshInterval: 15_000,
+    revalidateOnFocus: true,
+  })
+  return { signals: data, error, isLoading, mutate }
 }

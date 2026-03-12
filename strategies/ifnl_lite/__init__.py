@@ -127,7 +127,7 @@ class IfnlLiteStrategy(BaseStrategy):
         total = cur.fetchone()[0]
         return {"total": total, "limit": limit, "offset": offset, "data": data}
 
-    def get_stats(self, conn: sqlite3.Connection) -> dict:
+    def get_stats(self, conn: sqlite3.Connection, mode: str | None = None) -> dict:
         cur = conn.cursor()
 
         def scalar(sql, params=()):

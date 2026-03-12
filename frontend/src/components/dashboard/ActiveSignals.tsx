@@ -4,9 +4,10 @@ import { Badge } from '@/components/ui/Badge'
 
 interface ActiveSignalsProps {
   signals: Signal[]
+  onSold?: () => void
 }
 
-export function ActiveSignals({ signals }: ActiveSignalsProps) {
+export function ActiveSignals({ signals, onSold }: ActiveSignalsProps) {
   return (
     <div>
       <div style={{
@@ -25,7 +26,7 @@ export function ActiveSignals({ signals }: ActiveSignalsProps) {
               color: 'var(--text3)', padding: '20px 0',
             }}>No active signals</div>
           ) : (
-            signals.map(s => <SignalCard key={s.id} signal={s} />)
+            signals.map(s => <SignalCard key={s.id} signal={s} onSold={onSold} />)
           )}
         </div>
       </div>

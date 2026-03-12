@@ -150,7 +150,8 @@ def init_db(db_path: str = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.d
             last_scan_at    TEXT,
             next_scan_at    TEXT,
             last_error      TEXT,
-            scan_count      INTEGER DEFAULT 0
+            scan_count      INTEGER DEFAULT 0,
+            trading_mode    TEXT DEFAULT 'paper'  -- paper | live (controlled from UI)
         );
         INSERT OR IGNORE INTO bot_status (id) VALUES (1);
 
@@ -198,7 +199,13 @@ def init_db(db_path: str = os.environ.get("POLYAGENT_DB", "/app/data/polyagent.d
             pnl_pct             REAL,
             status              TEXT DEFAULT 'open',  -- open | resolved | expired
             mode                TEXT DEFAULT 'paper',  -- paper | live
-            order_id            TEXT                   -- CLOB order ID (live mode only)
+            order_id            TEXT,                  -- CLOB order ID (live mode only)
+            stop_loss_price     REAL,                  -- auto stop-loss trigger price
+            highest_price_seen  REAL,                  -- for trailing stop
+            trailing_stop_price REAL,                  -- calculated: highest - distance
+            exit_reason         TEXT,                  -- stop_loss | trailing_stop | time_exit | manual_tp | manual_sell
+            current_price       REAL,                  -- last checked price
+            last_price_check    TEXT                   -- timestamp of last price check
         );
 
         -- Strategy registry (multi-strategy architecture)
@@ -1473,15 +1480,23 @@ if __name__ == "__main__":
 
     mode = cli_params.get("mode", "backtest")
 
-    # Allow POLYAGENT_MODE env var to override default (but CLI --mode takes precedence)
-    if mode == "backtest" and os.environ.get("POLYAGENT_MODE") in ("paper", "live"):
-        mode = os.environ["POLYAGENT_MODE"]
-
     strategy_slug = cli_params.get("strategy", "bond_hunter")
 
     # Inicializar BD primero para tener acceso a config y bot_status
     conn_init = init_db()
     conn_init.row_factory = sqlite3.Row
+
+    # Mode resolution: CLI --mode > DB bot_status.trading_mode > ENV POLYAGENT_MODE > 'paper'
+    if mode == "backtest":
+        # CLI didn't specify a mode — read from DB first, then env var
+        try:
+            cur_mode = conn_init.cursor()
+            cur_mode.execute("SELECT trading_mode FROM bot_status WHERE id=1")
+            row_mode = cur_mode.fetchone()
+            db_mode = row_mode["trading_mode"] if row_mode and row_mode["trading_mode"] else None
+        except Exception:
+            db_mode = None
+        mode = db_mode or os.environ.get("POLYAGENT_MODE", "paper")
 
     if mode in ("paper", "live"):
         # Verificar si el bot está habilitado (a menos que se fuerce con --force)

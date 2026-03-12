@@ -1,7 +1,7 @@
 export interface Signal {
   id: number
   status: 'open' | 'resolved' | 'expired'
-  outcome: 'YES' | 'NO' | null
+  outcome: 'YES' | 'NO' | 'RISK_EXIT' | null
   detected_at: string
   resolved_at: string | null
   token_id: string
@@ -22,6 +22,19 @@ export interface Signal {
   wash_score: string | null
   pnl_usdc: number | null
   pnl_pct: number | null
+  // Risk management fields
+  stop_loss_price: number | null
+  highest_price_seen: number | null
+  trailing_stop_price: number | null
+  exit_reason: string | null
+  current_price: number | null
+  last_price_check: string | null
+  mode: string | null
+  // Live P&L calculations (only from /signals/open/live)
+  pnl_if_sell_now?: number | null
+  pnl_if_wait?: number | null
+  opportunity_cost?: number | null
+  can_take_profit?: boolean
 }
 
 export interface PnlPoint {
@@ -43,10 +56,20 @@ export interface Stats {
   worst_trade: number
   total_fees: number
   pnl_series: PnlPoint[]
+  // Risk exit counters
+  risk_exits: number
+  stop_losses: number
+  trailing_stops: number
+  time_exits: number
+  manual_tps: number
+  manual_sells: number
+  // Bot state
   bot_enabled: boolean
   bot_last_scan: string | null
   bot_scan_count: number
   bot_last_error: string | null
+  trading_mode: string
+  active_strategies: number
   generated_at: string
 }
 
@@ -82,6 +105,17 @@ export interface BotStatus {
   next_scan_at: string | null
   last_error: string | null
   scan_count: number
+  trading_mode: string
+}
+
+export interface SellResponse {
+  sold: boolean
+  signal_id: number
+  exit_reason: string
+  sell_price: number
+  pnl_usdc: number
+  pnl_pct: number
+  mode?: string
 }
 
 export interface ScanLog {

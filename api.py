@@ -63,6 +63,21 @@ def rows(cur) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def _get_db_trading_mode() -> str:
+    """Read trading mode from DB, fallback to env var, fallback to 'paper'."""
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT trading_mode FROM bot_status WHERE id=1")
+        row = cur.fetchone()
+        conn.close()
+        if row and row["trading_mode"]:
+            return row["trading_mode"]
+    except Exception:
+        pass
+    return TRADING_MODE
+
+
 # ─────────────────────────────────────────────
 # MODELS
 # ─────────────────────────────────────────────
@@ -92,8 +107,14 @@ def health():
 
 @app.get("/trading-mode")
 def get_trading_mode():
-    """Returns the current trading mode (paper or live)."""
-    return {"mode": TRADING_MODE}
+    """Returns the current trading mode (from DB, fallback to env var)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT trading_mode FROM bot_status WHERE id=1")
+    row = cur.fetchone()
+    conn.close()
+    mode = (row["trading_mode"] if row and row["trading_mode"] else None) or TRADING_MODE
+    return {"mode": mode}
 
 
 @app.post("/orders/cancel-all")
@@ -204,6 +225,36 @@ def disable_bot():
     return {"enabled": False, "message": "Bot disabled"}
 
 
+class ModeUpdate(BaseModel):
+    mode: str  # "paper" | "live"
+
+
+@app.post("/bot/mode")
+def set_trading_mode(req: ModeUpdate):
+    """Switch trading mode (paper/live). Stored in DB, read by agent.py on each scan."""
+    if req.mode not in ("paper", "live"):
+        raise HTTPException(status_code=400, detail="Mode must be 'paper' or 'live'")
+
+    # If switching to live, verify credentials are configured
+    if req.mode == "live":
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT private_key, funder_address, api_key FROM credentials WHERE id=1")
+        cred_row = cur.fetchone()
+        conn.close()
+        if not cred_row or not cred_row["private_key"] or not cred_row["api_key"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot switch to live mode — configure credentials in Settings first"
+            )
+
+    conn = get_conn()
+    conn.execute("UPDATE bot_status SET trading_mode=? WHERE id=1", (req.mode,))
+    conn.commit()
+    conn.close()
+    return {"mode": req.mode, "message": f"Trading mode set to {req.mode.upper()}"}
+
+
 @app.post("/bot/scan-now")
 def scan_now():
     """Lanza un scan inmediato en background sin esperar al cron."""
@@ -216,9 +267,10 @@ def scan_now():
     if not row or not row["enabled"]:
         raise HTTPException(status_code=400, detail="Bot is disabled — enable it first")
 
+    current_mode = _get_db_trading_mode()
     try:
         proc = subprocess.Popen(
-            [sys.executable, AGENT_SCRIPT, "--mode", TRADING_MODE, "--force"],
+            [sys.executable, AGENT_SCRIPT, "--mode", current_mode, "--force"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -226,8 +278,8 @@ def scan_now():
         return {
             "triggered": True,
             "pid": proc.pid,
-            "mode": TRADING_MODE,
-            "message": f"Scan launched in {TRADING_MODE} mode (pid={proc.pid}). Results appear in ~2-5 min.",
+            "mode": current_mode,
+            "message": f"Scan launched in {current_mode} mode (pid={proc.pid}). Results appear in ~2-5 min.",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to launch agent: {e}")
@@ -288,13 +340,218 @@ def get_signal(signal_id: int):
 
 
 # ─────────────────────────────────────────────
+# LIVE SIGNALS + MANUAL ACTIONS
+# ─────────────────────────────────────────────
+
+# Price cache: {token_id: (price, timestamp)}
+_price_cache: dict[str, tuple[float, float]] = {}
+PRICE_CACHE_TTL = 30  # seconds
+
+
+def _get_cached_price(token_id: str) -> float | None:
+    """Fetch current price with 30s cache to avoid API spam."""
+    cached = _price_cache.get(token_id)
+    if cached and (time.time() - cached[1]) < PRICE_CACHE_TTL:
+        return cached[0]
+
+    from strategies.bond_hunter import _fetch_current_price
+    price = _fetch_current_price(token_id)
+    if price is not None:
+        _price_cache[token_id] = (price, time.time())
+    return price
+
+
+def _compute_pnl_scenarios(signal: dict, current_price: float) -> dict:
+    """Compute P&L for sell-now vs wait-for-resolution scenarios."""
+    shares = signal["shares"] or 0
+    position_usdc = signal["position_usdc"] or 0
+    protocol_fee = signal["protocol_fee"] or 0
+    fee_rate = 0.005
+
+    # P&L if sell now (sell at bid)
+    bid_price = current_price - 0.005
+    sell_fee = shares * bid_price * fee_rate
+    pnl_if_sell_now = (shares * bid_price - sell_fee) - position_usdc - protocol_fee
+
+    # P&L if wait for YES resolution (redeem at 0.99)
+    redeem_price = 0.99
+    redeem_fee = shares * redeem_price * fee_rate
+    pnl_if_wait = (shares * redeem_price - redeem_fee) - position_usdc - protocol_fee
+
+    # Opportunity cost of selling early
+    opportunity_cost = pnl_if_wait - pnl_if_sell_now
+
+    return {
+        "current_price": round(current_price, 4),
+        "pnl_if_sell_now": round(pnl_if_sell_now, 4),
+        "pnl_if_wait": round(pnl_if_wait, 4),
+        "opportunity_cost": round(opportunity_cost, 4),
+        "can_take_profit": pnl_if_sell_now > 0,
+    }
+
+
+@app.get("/signals/open/live")
+def get_open_signals_live():
+    """Open signals enriched with real-time prices and P&L calculations."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM signals WHERE status='open' ORDER BY detected_at DESC")
+    signals = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    for s in signals:
+        token_id = s.get("token_id")
+        if not token_id:
+            continue
+        price = _get_cached_price(token_id)
+        if price is not None:
+            pnl_data = _compute_pnl_scenarios(s, price)
+            s.update(pnl_data)
+        else:
+            s["current_price"] = None
+            s["pnl_if_sell_now"] = None
+            s["pnl_if_wait"] = None
+            s["opportunity_cost"] = None
+            s["can_take_profit"] = False
+
+    return {"total": len(signals), "data": signals}
+
+
+class SellRequest(BaseModel):
+    reason: str = "manual_sell"  # "take_profit" | "manual_sell"
+
+
+@app.post("/signals/{signal_id}/sell")
+def sell_signal_live(signal_id: int, req: SellRequest):
+    """Execute a live sell for an open signal. Only works for mode='live' signals."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM signals WHERE id=? AND status='open'", (signal_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Open signal not found")
+
+    signal = dict(row)
+    if signal.get("mode") != "live":
+        conn.close()
+        raise HTTPException(status_code=400, detail="Signal is not in live mode — use /sell-paper for paper signals")
+
+    token_id = signal["token_id"]
+    shares = signal["shares"] or 0
+    position_usdc = signal["position_usdc"] or 0
+    protocol_fee = signal["protocol_fee"] or 0
+
+    # Get current price
+    price = _get_cached_price(token_id)
+    if price is None:
+        conn.close()
+        raise HTTPException(status_code=502, detail="Cannot fetch current price — try again")
+
+    # Execute real sell
+    try:
+        from clob_client import sell_position
+        sell_price = round(price - 0.01, 2)  # below market for quick fill
+        sell_size = round(shares, 2)
+        if sell_size < 1.0:
+            conn.close()
+            raise HTTPException(status_code=400, detail=f"Position too small to sell: {sell_size} shares")
+        result = sell_position(token_id, sell_size, sell_price)
+    except ImportError:
+        conn.close()
+        raise HTTPException(status_code=500, detail="clob_client not available")
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"Sell failed: {e}")
+
+    # Calculate P&L
+    bid_price = price - 0.005
+    sell_fee = shares * bid_price * 0.005
+    pnl = (shares * bid_price - sell_fee) - position_usdc - protocol_fee
+    pnl_pct = (pnl / position_usdc * 100) if position_usdc else 0
+
+    exit_reason = "manual_tp" if req.reason == "take_profit" else "manual_sell"
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    conn.execute("""
+        UPDATE signals SET
+            status='resolved', outcome='RISK_EXIT', exit_reason=?,
+            pnl_usdc=?, pnl_pct=?, resolved_at=?,
+            current_price=?, last_price_check=?
+        WHERE id=?
+    """, (exit_reason, round(pnl, 4), round(pnl_pct, 2), now_iso, price, now_iso, signal_id))
+    conn.commit()
+    conn.close()
+
+    return {
+        "sold": True, "signal_id": signal_id, "exit_reason": exit_reason,
+        "sell_price": price, "pnl_usdc": round(pnl, 4), "pnl_pct": round(pnl_pct, 2),
+    }
+
+
+@app.post("/signals/{signal_id}/sell-paper")
+def sell_signal_paper(signal_id: int, req: SellRequest):
+    """Mark a paper signal as sold (no real order). Calculates realistic P&L."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM signals WHERE id=? AND status='open'", (signal_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Open signal not found")
+
+    signal = dict(row)
+    token_id = signal["token_id"]
+    shares = signal["shares"] or 0
+    position_usdc = signal["position_usdc"] or 0
+    protocol_fee = signal["protocol_fee"] or 0
+
+    price = _get_cached_price(token_id)
+    if price is None:
+        conn.close()
+        raise HTTPException(status_code=502, detail="Cannot fetch current price — try again")
+
+    # Realistic P&L: sell at bid with fees
+    bid_price = price - 0.005
+    sell_fee = shares * bid_price * 0.005
+    pnl = (shares * bid_price - sell_fee) - position_usdc - protocol_fee
+    pnl_pct = (pnl / position_usdc * 100) if position_usdc else 0
+
+    exit_reason = "manual_tp" if req.reason == "take_profit" else "manual_sell"
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    conn.execute("""
+        UPDATE signals SET
+            status='resolved', outcome='RISK_EXIT', exit_reason=?,
+            pnl_usdc=?, pnl_pct=?, resolved_at=?,
+            current_price=?, last_price_check=?
+        WHERE id=?
+    """, (exit_reason, round(pnl, 4), round(pnl_pct, 2), now_iso, price, now_iso, signal_id))
+    conn.commit()
+    conn.close()
+
+    return {
+        "sold": True, "signal_id": signal_id, "exit_reason": exit_reason,
+        "sell_price": price, "pnl_usdc": round(pnl, 4), "pnl_pct": round(pnl_pct, 2),
+        "mode": "paper",
+    }
+
+
+# ─────────────────────────────────────────────
 # STATS
 # ─────────────────────────────────────────────
 
 @app.get("/stats")
-def get_stats():
+def get_stats(mode: Optional[str] = Query(None, description="Filter by mode: paper | live")):
     conn = get_conn()
     cur = conn.cursor()
+
+    # Build mode filter
+    mode_filter = ""
+    mode_params: tuple = ()
+    if mode in ("paper", "live"):
+        mode_filter = " AND mode=?"
+        mode_params = (mode,)
 
     def scalar(sql, params=()):
         cur.execute(sql, params)
@@ -309,22 +566,30 @@ def get_stats():
     cur.execute("SELECT COUNT(*) FROM strategies WHERE enabled=1")
     active_strategies = cur.fetchone()[0] or 0
 
-    total      = scalar("SELECT COUNT(*) FROM signals")
-    open_c     = scalar("SELECT COUNT(*) FROM signals WHERE status='open'")
-    resolved_c = scalar("SELECT COUNT(*) FROM signals WHERE status='resolved'")
-    wins       = scalar("SELECT COUNT(*) FROM signals WHERE outcome='YES'")
-    losses     = scalar("SELECT COUNT(*) FROM signals WHERE outcome='NO'")
-    total_pnl  = scalar("SELECT SUM(pnl_usdc) FROM signals WHERE status='resolved'")
-    avg_spread = scalar("SELECT AVG(spread_entry_pct) FROM signals")
-    best       = scalar("SELECT MAX(pnl_usdc) FROM signals WHERE status='resolved'")
-    worst      = scalar("SELECT MIN(pnl_usdc) FROM signals WHERE status='resolved'")
-    total_fees = scalar("SELECT SUM(protocol_fee) FROM signals WHERE status='resolved'")
+    total      = scalar(f"SELECT COUNT(*) FROM signals WHERE 1=1{mode_filter}", mode_params)
+    open_c     = scalar(f"SELECT COUNT(*) FROM signals WHERE status='open'{mode_filter}", mode_params)
+    resolved_c = scalar(f"SELECT COUNT(*) FROM signals WHERE status='resolved'{mode_filter}", mode_params)
+    wins       = scalar(f"SELECT COUNT(*) FROM signals WHERE outcome='YES'{mode_filter}", mode_params)
+    losses     = scalar(f"SELECT COUNT(*) FROM signals WHERE outcome='NO'{mode_filter}", mode_params)
+    total_pnl  = scalar(f"SELECT SUM(pnl_usdc) FROM signals WHERE status='resolved'{mode_filter}", mode_params)
+    avg_spread = scalar(f"SELECT AVG(spread_entry_pct) FROM signals WHERE 1=1{mode_filter}", mode_params)
+    best       = scalar(f"SELECT MAX(pnl_usdc) FROM signals WHERE status='resolved'{mode_filter}", mode_params)
+    worst      = scalar(f"SELECT MIN(pnl_usdc) FROM signals WHERE status='resolved'{mode_filter}", mode_params)
+    total_fees = scalar(f"SELECT SUM(protocol_fee) FROM signals WHERE status='resolved'{mode_filter}", mode_params)
 
-    cur.execute("""
+    # Exit reason counters
+    risk_exits     = scalar(f"SELECT COUNT(*) FROM signals WHERE outcome='RISK_EXIT'{mode_filter}", mode_params)
+    stop_losses    = scalar(f"SELECT COUNT(*) FROM signals WHERE exit_reason='stop_loss'{mode_filter}", mode_params)
+    trailing_stops = scalar(f"SELECT COUNT(*) FROM signals WHERE exit_reason='trailing_stop'{mode_filter}", mode_params)
+    time_exits     = scalar(f"SELECT COUNT(*) FROM signals WHERE exit_reason='time_exit'{mode_filter}", mode_params)
+    manual_tps     = scalar(f"SELECT COUNT(*) FROM signals WHERE exit_reason='manual_tp'{mode_filter}", mode_params)
+    manual_sells   = scalar(f"SELECT COUNT(*) FROM signals WHERE exit_reason='manual_sell'{mode_filter}", mode_params)
+
+    cur.execute(f"""
         SELECT resolved_at, pnl_usdc FROM signals
-        WHERE status='resolved' AND resolved_at IS NOT NULL
+        WHERE status='resolved' AND resolved_at IS NOT NULL{mode_filter}
         ORDER BY resolved_at ASC
-    """)
+    """, mode_params)
     pnl_series = []
     cumulative = 0.0
     for r in cur.fetchall():
@@ -348,15 +613,22 @@ def get_stats():
         "losses":         losses,
         "win_rate":       win_rate,
         "total_pnl":      round(float(total_pnl), 4),
-        "avg_spread_pct": round(float(avg_spread) * 100, 3),
+        "avg_spread_pct": round(float(avg_spread) * 100, 3) if avg_spread else 0,
         "best_trade":     round(float(best), 4),
         "worst_trade":    round(float(worst), 4),
         "total_fees":     round(float(total_fees), 4),
         "pnl_series":     pnl_series,
+        "risk_exits":     risk_exits,
+        "stop_losses":    stop_losses,
+        "trailing_stops": trailing_stops,
+        "time_exits":     time_exits,
+        "manual_tps":     manual_tps,
+        "manual_sells":   manual_sells,
         "bot_enabled":    bool(bot.get("enabled", 0)),
         "bot_last_scan":  bot.get("last_scan_at"),
         "bot_scan_count": bot.get("scan_count", 0),
         "bot_last_error": bot.get("last_error"),
+        "trading_mode":   bot.get("trading_mode", "paper"),
         "active_strategies": active_strategies,
         "generated_at":   datetime.now(timezone.utc).isoformat(),
     }
@@ -387,7 +659,7 @@ def list_strategies():
 
 
 @app.get("/strategies/{slug}")
-def get_strategy_detail(slug: str):
+def get_strategy_detail(slug: str, mode: Optional[str] = Query(None, description="Filter stats by mode")):
     """Get strategy detail including config and stats."""
     conn = get_conn()
     cur = conn.cursor()
@@ -407,7 +679,7 @@ def get_strategy_detail(slug: str):
 
     # Get strategy stats
     if strategy:
-        result["stats"] = strategy.get_stats(conn)
+        result["stats"] = strategy.get_stats(conn, mode=mode)
     else:
         result["stats"] = {}
 
@@ -537,15 +809,16 @@ def strategy_scan_now(slug: str):
     if not row["enabled"]:
         raise HTTPException(status_code=400, detail=f"Strategy '{slug}' is disabled — enable it first")
 
+    current_mode = _get_db_trading_mode()
     try:
         proc = subprocess.Popen(
-            [sys.executable, AGENT_SCRIPT, "--mode", TRADING_MODE, "--strategy", slug, "--force"],
+            [sys.executable, AGENT_SCRIPT, "--mode", current_mode, "--strategy", slug, "--force"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        return {"triggered": True, "pid": proc.pid, "strategy": slug, "mode": TRADING_MODE,
-                "message": f"Scan launched in {TRADING_MODE} mode (pid={proc.pid})"}
+        return {"triggered": True, "pid": proc.pid, "strategy": slug, "mode": current_mode,
+                "message": f"Scan launched in {current_mode} mode (pid={proc.pid})"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to launch scan: {e}")
 
@@ -573,13 +846,13 @@ def get_strategy_open_signals(slug: str, limit: int = Query(100, le=500), offset
 
 
 @app.get("/strategies/{slug}/stats")
-def get_strategy_stats(slug: str):
+def get_strategy_stats(slug: str, mode: Optional[str] = Query(None, description="Filter by mode: paper | live")):
     """Get stats for a specific strategy."""
     strategy = get_strategy(slug)
     if not strategy:
         raise HTTPException(status_code=404, detail=f"Strategy '{slug}' not found")
     conn = get_conn()
-    stats = strategy.get_stats(conn)
+    stats = strategy.get_stats(conn, mode=mode)
     conn.close()
     return stats
 

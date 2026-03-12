@@ -91,9 +91,11 @@ echo "        App: http://${SERVER_IP}:3000"
 
 # ── 5. Configurar cron ─────────────────────
 echo ""
-echo "[5/6] Configuring cron job (every 15 min, mode=$TRADING_MODE)..."
+echo "[5/6] Configuring cron job (every 15 min, mode from DB)..."
 # Source .env in cron so CLOB credentials are available in live mode
-CRON_CMD="*/15 * * * * cd $SCRIPT_DIR && set -a && [ -f $SCRIPT_DIR/.env ] && . $SCRIPT_DIR/.env; set +a && $PYTHON_BIN $SCRIPT_DIR/agent.py --mode $TRADING_MODE >> $LOG_DIR/agent.log 2>&1"
+# NOTE: No --mode flag — agent.py reads trading mode from bot_status.trading_mode in DB
+# This allows switching paper/live from the dashboard without reconfiguring cron
+CRON_CMD="*/15 * * * * cd $SCRIPT_DIR && set -a && [ -f $SCRIPT_DIR/.env ] && . $SCRIPT_DIR/.env; set +a && $PYTHON_BIN $SCRIPT_DIR/agent.py >> $LOG_DIR/agent.log 2>&1"
 
 # Añadir solo si no existe ya
 ( crontab -l 2>/dev/null | grep -v "agent.py"; echo "$CRON_CMD" ) | crontab -

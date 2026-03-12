@@ -1,7 +1,7 @@
 'use client'
 import { useState } from 'react'
 import useSWR from 'swr'
-import { fetchBotStatus, enableBot, disableBot, scanNow } from '@/lib/api'
+import { fetchBotStatus, enableBot, disableBot, scanNow, setTradingMode } from '@/lib/api'
 
 export function useBot() {
   const { data, error, isLoading, mutate } = useSWR('/bot', fetchBotStatus, {
@@ -42,6 +42,19 @@ export function useBot() {
     }
   }
 
+  async function switchMode(mode: string) {
+    setActionLoading(true)
+    setActionError(null)
+    try {
+      await setTradingMode(mode)
+      await mutate()
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Unknown error')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
   return {
     bot: data,
     error,
@@ -50,5 +63,6 @@ export function useBot() {
     actionError,
     toggle,
     triggerScan,
+    switchMode,
   }
 }

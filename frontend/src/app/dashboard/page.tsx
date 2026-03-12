@@ -6,9 +6,11 @@ import { KpiGrid } from '@/components/dashboard/KpiGrid'
 import { ActiveSignals } from '@/components/dashboard/ActiveSignals'
 import { RecentSignalsTable } from '@/components/dashboard/RecentSignalsTable'
 import { BotControl } from '@/components/dashboard/BotControl'
+import { ModeToggle } from '@/components/dashboard/ModeToggle'
 import { IfnlDashboard } from '@/components/dashboard/IfnlDashboard'
 import { useStats } from '@/hooks/useStats'
-import { useSignals, useOpenSignals } from '@/hooks/useSignals'
+import { useSignals, useOpenSignalsLive } from '@/hooks/useSignals'
+import { useBot } from '@/hooks/useBot'
 
 const PnlChart = dynamic(
   () => import('@/components/dashboard/PnlChart').then(m => ({ default: m.PnlChart })),
@@ -29,8 +31,10 @@ type TabKey = 'bond_hunter' | 'ifnl_lite'
 export default function DashboardPage() {
   const [activeTab, setActiveTab] = useState<TabKey>('bond_hunter')
   const { stats, isLoading: statsLoading } = useStats()
-  const { signals: openSignals } = useOpenSignals()
+  const { signals: openSignals, mutate: mutateOpen } = useOpenSignalsLive()
   const { signals: recentSignals } = useSignals({ limit: 20 })
+  const { bot, switchMode, actionLoading: modeLoading } = useBot()
+  const tradingMode = stats?.trading_mode ?? bot?.trading_mode ?? 'paper'
 
   const tabs: { key: TabKey; label: string; type: string; color: string }[] = [
     { key: 'bond_hunter', label: 'Bond Hunter', type: 'cron', color: 'var(--green)' },
@@ -81,7 +85,10 @@ export default function DashboardPage() {
       {/* Bond Hunter Tab */}
       {activeTab === 'bond_hunter' && (
         <>
-          <BotControl />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+            <div style={{ flex: 1 }}><BotControl /></div>
+            <ModeToggle mode={tradingMode} onSwitch={switchMode} disabled={modeLoading} />
+          </div>
           {statsLoading || !stats ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
               <div className="kpi-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 16 }}>
@@ -94,7 +101,7 @@ export default function DashboardPage() {
               <KpiGrid stats={stats} />
               <div className="grid-row" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginBottom: 24 }}>
                 <PnlChart data={stats.pnl_series} totalPnl={stats.total_pnl} />
-                <ActiveSignals signals={openSignals?.data ?? []} />
+                <ActiveSignals signals={openSignals?.data ?? []} onSold={() => mutateOpen()} />
               </div>
               <RecentSignalsTable
                 signals={recentSignals?.data ?? []}

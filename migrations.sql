@@ -112,6 +112,27 @@ ALTER TABLE signals ADD COLUMN order_id TEXT;
 -- Migration 005: Credentials store
 -- Added: Settings page for private key + auto-derived funder/API creds
 -- ===========================================
+-- ===========================================
+-- Migration 006: Risk management columns on signals
+-- Added: Stop-loss, trailing stop, price tracking
+-- ===========================================
+ALTER TABLE signals ADD COLUMN stop_loss_price REAL;
+ALTER TABLE signals ADD COLUMN highest_price_seen REAL;
+ALTER TABLE signals ADD COLUMN trailing_stop_price REAL;
+ALTER TABLE signals ADD COLUMN exit_reason TEXT;
+ALTER TABLE signals ADD COLUMN current_price REAL;
+ALTER TABLE signals ADD COLUMN last_price_check TEXT;
+
+-- ===========================================
+-- Migration 007: Trading mode in bot_status
+-- Added: UI-controlled paper/live mode switching
+-- ===========================================
+ALTER TABLE bot_status ADD COLUMN trading_mode TEXT DEFAULT 'paper';
+
+-- ===========================================
+-- Migration 005: Credentials store
+-- Added: Settings page for private key + auto-derived funder/API creds
+-- ===========================================
 CREATE TABLE IF NOT EXISTS credentials (
     id              INTEGER PRIMARY KEY DEFAULT 1,
     private_key     TEXT,

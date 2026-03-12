@@ -12,8 +12,28 @@ interface RecentSignalsTableProps {
   total: number
 }
 
+const EXIT_REASON_LABELS: Record<string, string> = {
+  stop_loss: 'SL',
+  trailing_stop: 'TS',
+  time_exit: 'TIME',
+  manual_tp: 'TP',
+  manual_sell: 'SELL',
+}
+
 function signalBadge(signal: Signal) {
   if (signal.status === 'open') return <Badge variant="open" />
+  if (signal.outcome === 'RISK_EXIT') {
+    const label = signal.exit_reason ? EXIT_REASON_LABELS[signal.exit_reason] ?? signal.exit_reason : 'EXIT'
+    return (
+      <span style={{
+        fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700,
+        padding: '2px 6px', borderRadius: 4,
+        background: 'rgba(231,76,60,0.15)', color: 'var(--red)',
+      }}>
+        {label}
+      </span>
+    )
+  }
   if (signal.outcome === 'YES') return <Badge variant="win" />
   return <Badge variant="loss" />
 }

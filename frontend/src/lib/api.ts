@@ -1,4 +1,4 @@
-import type { Stats, SignalsResponse, Signal, Run, BotConfig, BotStatus, ScanLogsResponse, StrategiesResponse, Strategy, Credentials, CredentialsSaveResponse, CredentialsTestResponse } from '@/types'
+import type { Stats, SignalsResponse, Signal, Run, BotConfig, BotStatus, ScanLogsResponse, StrategiesResponse, Strategy, Credentials, CredentialsSaveResponse, CredentialsTestResponse, SellResponse } from '@/types'
 
 const BASE = '/api'
 
@@ -82,4 +82,17 @@ export const saveCredentials      = (data: { private_key?: string; signature_typ
   post<CredentialsSaveResponse>('/settings/credentials', data)
 export const testCredentials      = () => post<CredentialsTestResponse>('/settings/credentials/test')
 export const fetchTradingMode     = () => get<{ mode: string }>('/trading-mode')
+
+// Live signals with real-time prices
+export const fetchOpenSignalsLive = () => get<{ total: number; data: Signal[] }>('/signals/open/live')
+
+// Manual sell actions
+export const sellSignal      = (id: number, reason: string) =>
+  post<SellResponse>(`/signals/${id}/sell`, { reason })
+export const sellSignalPaper = (id: number, reason: string) =>
+  post<SellResponse>(`/signals/${id}/sell-paper`, { reason })
+
+// Mode switching
+export const setTradingMode = (mode: string) =>
+  post<{ mode: string; message: string }>('/bot/mode', { mode })
 

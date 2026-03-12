@@ -44,7 +44,7 @@ export function KpiGrid({ stats }: KpiGridProps) {
         icon="◉"
         label="Active Signals"
         value={String(stats.open)}
-        delta="resolving in <48h"
+        delta={stats.risk_exits ? `${stats.risk_exits} risk exits · ${stats.stop_losses} SL` : 'resolving in <48h'}
         deltaPositive={false}
         accent="yellow"
       />

@@ -3,6 +3,8 @@ import { useState, useEffect } from 'react'
 import type { Stats, BotConfig } from '@/types'
 import { formatUSDC, formatPct } from '@/lib/format'
 import { useConfig } from '@/hooks/useConfig'
+import { useStrategy } from '@/hooks/useStrategies'
+import { updateStrategyConfig } from '@/lib/api'
 
 const PARAM_META: {
   key: keyof Omit<BotConfig, 'id' | 'updated_at' | 'scan_interval_min'>
@@ -24,13 +26,34 @@ const PARAM_META: {
   { key: 'fee_rate',                    label: 'FEE_RATE',                    hint: 'Protocol fee estimate',                 step: '0.001', min: '0', max: '1' },
 ]
 
+const RISK_PARAM_META: {
+  key: string
+  label: string
+  hint: string
+  step: string
+  min?: string
+  max?: string
+  type: 'number' | 'toggle'
+}[] = [
+  { key: 'stop_loss_enabled',         label: 'STOP_LOSS',            hint: 'Enable automatic stop-loss',            step: '', type: 'toggle' },
+  { key: 'stop_loss_multiplier',      label: 'SL_MULTIPLIER',        hint: 'Stop = entry - (X × expected profit)', step: '0.5', min: '1', max: '5', type: 'number' },
+  { key: 'trailing_stop_enabled',     label: 'TRAILING_STOP',        hint: 'Enable trailing stop',                  step: '', type: 'toggle' },
+  { key: 'trailing_stop_activation',  label: 'TRAIL_ACTIVATION',     hint: 'Activate when +X above entry',          step: '0.005', min: '0', max: '0.1', type: 'number' },
+  { key: 'trailing_stop_distance',    label: 'TRAIL_DISTANCE',       hint: 'Trail X below highest seen',            step: '0.01', min: '0.01', max: '0.2', type: 'number' },
+  { key: 'time_exit_enabled',         label: 'TIME_EXIT',            hint: 'Enable time-based exit',                step: '', type: 'toggle' },
+  { key: 'time_exit_hours',           label: 'TIME_EXIT_HOURS',      hint: 'Sell if <X hours to close & in loss',   step: '0.5', min: '0.5', max: '12', type: 'number' },
+  { key: 'order_fill_timeout_min',    label: 'FILL_TIMEOUT',         hint: 'Cancel unfilled orders after X min',    step: '5', min: '5', max: '120', type: 'number' },
+]
+
 interface BondHunterCardProps {
   stats?: Stats
 }
 
 export function BondHunterCard({ stats }: BondHunterCardProps) {
   const { config, isLoading, saveConfig } = useConfig()
+  const { strategy, mutate: mutateStrategy } = useStrategy('bond_hunter')
   const [local, setLocal] = useState<Partial<BotConfig>>({})
+  const [riskLocal, setRiskLocal] = useState<Record<string, number | boolean>>({})
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -42,16 +65,36 @@ export function BondHunterCard({ stats }: BondHunterCardProps) {
     }
   }, [config])
 
+  // Sync risk params when strategy config loads
+  useEffect(() => {
+    if (strategy?.config && Object.keys(riskLocal).length === 0) {
+      const rc: Record<string, number | boolean> = {}
+      for (const p of RISK_PARAM_META) {
+        const val = (strategy.config as Record<string, unknown>)[p.key]
+        rc[p.key] = val as number | boolean
+      }
+      setRiskLocal(rc)
+    }
+  }, [strategy])
+
   function handleChange(key: keyof BotConfig, val: string) {
     setLocal(p => ({ ...p, [key]: parseFloat(val) || 0 }))
+  }
+
+  function handleRiskChange(key: string, val: string | boolean) {
+    setRiskLocal(p => ({ ...p, [key]: typeof val === 'boolean' ? val : (parseFloat(val) || 0) }))
   }
 
   async function handleSave() {
     setSaving(true)
     setSaveError(null)
     try {
+      // Save legacy config params
       const { id: _, updated_at: __, ...rest } = local as BotConfig
       await saveConfig(rest)
+      // Save risk management params to strategy config
+      await updateStrategyConfig('bond_hunter', riskLocal)
+      await mutateStrategy()
       setSaved(true)
       setTimeout(() => setSaved(false), 2500)
     } catch (e) {
@@ -63,6 +106,13 @@ export function BondHunterCard({ stats }: BondHunterCardProps) {
 
   function handleReset() {
     if (config) setLocal(config)
+    if (strategy?.config) {
+      const rc: Record<string, number | boolean> = {}
+      for (const p of RISK_PARAM_META) {
+        rc[p.key] = (strategy.config as Record<string, unknown>)[p.key] as number | boolean
+      }
+      setRiskLocal(rc)
+    }
   }
 
   const activeEnabled = Boolean(stats?.bot_enabled)
@@ -105,7 +155,7 @@ export function BondHunterCard({ stats }: BondHunterCardProps) {
           </div>
         </div>
 
-        {/* Status badge — toggle is done from BotControl in dashboard */}
+        {/* Status badge */}
         <div className="toggle-wrap" style={{ flexShrink: 0 }}>
           <div style={{
             fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '0.08em',
@@ -128,6 +178,8 @@ export function BondHunterCard({ stats }: BondHunterCardProps) {
           { value: stats ? formatUSDC(stats.total_pnl) : '—', label: 'Total PnL', green: true },
           { value: stats ? String(stats.total_signals) : '—', label: 'Total Signals', green: false },
           { value: stats ? formatPct(stats.avg_spread_pct, 2) : '—', label: 'Avg Spread', green: false },
+          { value: stats ? String(stats.stop_losses ?? 0) : '—', label: 'Stop Losses', green: false },
+          { value: stats ? String(stats.trailing_stops ?? 0) : '—', label: 'Trail Stops', green: false },
         ].map(({ value, label, green }) => (
           <div key={label} className="strategy-stat">
             <div style={{ fontFamily: 'var(--mono)', fontSize: 18, marginBottom: 4, color: green ? 'var(--green)' : 'var(--text)' }}>
@@ -190,6 +242,67 @@ export function BondHunterCard({ stats }: BondHunterCardProps) {
             </div>
           ))
         )}
+      </div>
+
+      {/* Risk Management Section */}
+      <div style={{ padding: '20px 28px 16px', borderTop: '1px solid var(--border)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>Risk Management</div>
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--red)', letterSpacing: '0.08em' }}>
+            · automatic protection
+          </span>
+        </div>
+      </div>
+
+      <div className="params-grid">
+        {RISK_PARAM_META.map(({ key, label, hint, step, min, max, type }) => (
+          <div key={key} className="param-item">
+            <div className="param-label" style={{
+              fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '0.12em',
+              textTransform: 'uppercase', color: 'var(--text3)', marginBottom: 10,
+            }}>{label}</div>
+            {type === 'toggle' ? (
+              <button
+                onClick={() => handleRiskChange(key, !riskLocal[key])}
+                style={{
+                  width: '100%', padding: '9px 12px', borderRadius: 8,
+                  border: `1px solid ${riskLocal[key] ? 'rgba(0,232,122,0.3)' : 'var(--border2)'}`,
+                  background: riskLocal[key] ? 'rgba(0,232,122,0.1)' : 'var(--bg)',
+                  color: riskLocal[key] ? 'var(--green)' : 'var(--text3)',
+                  fontFamily: 'var(--mono)', fontSize: 12, fontWeight: 600,
+                  cursor: 'pointer', transition: 'all 0.2s',
+                }}
+              >
+                {riskLocal[key] ? 'ON' : 'OFF'}
+              </button>
+            ) : (
+              <input
+                type="number"
+                value={(riskLocal[key] as number) ?? ''}
+                step={step}
+                min={min}
+                max={max}
+                onChange={e => handleRiskChange(key, e.target.value)}
+                style={{
+                  width: '100%', background: 'var(--bg)',
+                  border: '1px solid var(--border2)', borderRadius: 8,
+                  padding: '9px 12px', color: 'var(--text)',
+                  fontFamily: 'var(--mono)', fontSize: 13, outline: 'none',
+                  transition: 'border-color 0.2s, box-shadow 0.2s',
+                }}
+                onFocus={e => {
+                  e.currentTarget.style.borderColor = 'var(--green)'
+                  e.currentTarget.style.boxShadow = '0 0 0 2px var(--green-dim)'
+                }}
+                onBlur={e => {
+                  e.currentTarget.style.borderColor = 'var(--border2)'
+                  e.currentTarget.style.boxShadow = 'none'
+                }}
+              />
+            )}
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text3)', marginTop: 5 }}>{hint}</div>
+          </div>
+        ))}
       </div>
 
       {/* Footer */}

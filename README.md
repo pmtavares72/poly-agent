@@ -43,7 +43,7 @@ Bot de trading automatizado para mercados de predicción de Polymarket. Arquitec
 | Dashboard | Stats completos | Stats completos + order IDs reales |
 | Resolución de exits | Sintética (al resolver mercado) | Tokens se redimen automáticamente a $1.00 |
 
-**El modo por defecto es `paper`.** Tienes que activar `live` explícitamente en el `.env`.
+**El modo por defecto es `paper`.** Activa `live` desde el toggle en el dashboard o en el `.env`.
 
 ---
 
@@ -293,7 +293,7 @@ Monitoriza desde el dashboard en `http://localhost:3000`.
 
 | Variable | Descripción | Ejemplo |
 |----------|-------------|---------|
-| `POLYAGENT_MODE` | Modo de trading: `paper` o `live` | `live` |
+| `POLYAGENT_MODE` | Modo de trading fallback: `paper` o `live` (el dashboard toggle tiene prioridad) | `live` |
 | `POLYMARKET_PRIVATE_KEY` | Private key de wallet (64 hex chars, sin 0x) | `abcdef1234...` |
 | `POLYMARKET_FUNDER_ADDRESS` | Proxy wallet address de polymarket.com/settings | `0x1234...5678` |
 | `POLYMARKET_SIGNATURE_TYPE` | `0`=MetaMask, `1`=Email/Magic, `2`=Gnosis | `1` |
@@ -343,6 +343,28 @@ El bot incluye múltiples mecanismos de seguridad para proteger tu capital:
 - **Límite diario** (`POLYAGENT_DAILY_LOSS_LIMIT`): El bot pausa todo el trading si el P&L acumulado del día baja de este umbral. Default: -$50.
 - **Sin market orders**: Bond Hunter usa **solo órdenes limit (GTC)** a precios calculados. Cero market orders que puedan sufrir slippage.
 
+### Risk Management Automático (NUEVO)
+
+- **Stop-Loss automático**: Si el precio cae por debajo de `entry - (2 × expected_profit)`, se vende inmediatamente. Ejemplo: entry a $0.95, expected profit ~$0.045 → stop en ~$0.86.
+- **Trailing Stop**: Se activa cuando el precio sube +$0.01 sobre entry. Trail de $0.05 por debajo del precio más alto visto. Protege ganancias sin cortar winners.
+- **Time Exit**: Si faltan <2h para cierre y el precio está por debajo de entry → vender.
+- **Order Fill Check** (live): Cancela órdenes no ejecutadas después de 30 minutos.
+
+Todos los parámetros de risk management son configurables desde la página **Strategies** del dashboard.
+
+### Panel de Control Manual por Posición (NUEVO)
+
+Cada señal abierta en el dashboard muestra:
+- **Precio actual** en tiempo real (consultado vía CLOB API cada 15s)
+- **P&L si vendes ahora** — incluyendo spread (sell al bid) y fees de protocolo
+- **P&L si esperas resolución YES** — incluyendo fees de redención
+- **Coste de salida anticipada** — lo que pierdes por salir antes
+- **Precio de stop-loss** — donde se vendería automáticamente
+
+Botones de acción (requieren confirmación):
+- **Take Profit** — Vender al precio actual (solo visible si hay ganancia)
+- **Sell** — Vender inmediatamente para cortar pérdidas
+
 ### Verificación de Órdenes
 
 - **Check de balance**: Antes de cada orden, el bot verifica que hay suficiente USDC en el proxy wallet.
@@ -369,10 +391,23 @@ El bot incluye múltiples mecanismos de seguridad para proteger tu capital:
 ### Flujo de Ejecución (cada 15 minutos)
 
 ```
-1. Cron dispara: python3 agent.py --mode live --strategy bond_hunter
+1. Cron dispara: python3 agent.py
+   (el modo paper/live se lee de bot_status.trading_mode en la BD)
 
-2. FASE DE RESOLUCIÓN
-   ├─ Consulta señales abiertas (status='open', mode='live')
+2. FASE DE RISK MANAGEMENT (NUEVO — se ejecuta PRIMERO)
+   ├─ Para cada señal abierta:
+   │   ├─ Consulta precio actual vía CLOB last-trade-price
+   │   ├─ Actualiza current_price, highest_price_seen en BD
+   │   ├─ CHECK 1: Hard Stop-Loss
+   │   │   └─ Si current_price ≤ stop_loss_price → VENDER
+   │   ├─ CHECK 2: Trailing Stop
+   │   │   └─ Si trailing activo Y current ≤ trailing_stop_price → VENDER
+   │   └─ CHECK 3: Time Exit
+   │       └─ Si <2h para cierre Y current < entry → VENDER
+   └─ Paper: solo marca en BD. Live: ejecuta sell_position() + marca.
+
+3. FASE DE RESOLUCIÓN
+   ├─ Consulta señales abiertas (status='open')
    ├─ Para cada señal, consulta si el mercado resolvió (Gamma API)
    ├─ Si resolvió YES → tokens se redimen automáticamente a $1.00
    │   └─ P&L = (shares × $1.00) - position_usdc - fees
@@ -380,7 +415,11 @@ El bot incluye múltiples mecanismos de seguridad para proteger tu capital:
    │   └─ P&L = -position_usdc - fees
    └─ Actualiza status='resolved' con P&L
 
-3. FASE DE ESCANEO
+4. CHECK ORDER FILLS (solo live, NUEVO)
+   ├─ Verifica si órdenes limit se llenaron vía CLOB get_order()
+   └─ Cancela órdenes no ejecutadas después de 30 minutos
+
+5. FASE DE ESCANEO
    ├─ Fetch mercados abiertos de Gamma API
    ├─ Filtrar por: precio 0.92–0.995, liquidez, profit mínimo, wash score
    ├─ Para cada mercado que pasa los filtros:
@@ -412,8 +451,8 @@ El bot incluye múltiples mecanismos de seguridad para proteger tu capital:
    │
    └─ Fin del scan
 
-4. RESOLUCIÓN DE POSICIONES
-   ├─ Bond Hunter NO vende tokens — espera resolución del mercado
+6. RESOLUCIÓN DE POSICIONES
+   ├─ Bond Hunter espera resolución del mercado (pero ahora tiene stop-loss automático)
    ├─ Cuando el mercado resuelve YES:
    │   └─ Los YES tokens se convierten automáticamente en $1.00 USDC
    │       (redención on-chain, no requiere acción del bot)
@@ -574,8 +613,12 @@ sqlite3 data/polyagent.db < migrations.sql
 | POST | `/config` | Update config |
 | GET/POST | `/bot`, `/bot/enable`, `/bot/disable` | Control del bot |
 | POST | `/bot/scan-now` | Scan inmediato |
+| POST | `/bot/mode` | Cambiar modo paper/live (NUEVO) |
 | GET | `/signals`, `/signals/open` | Señales |
-| GET | `/stats` | KPIs agregados |
+| GET | `/signals/open/live` | Señales abiertas con precios en tiempo real + P&L (NUEVO) |
+| POST | `/signals/{id}/sell` | Venta manual live (NUEVO) |
+| POST | `/signals/{id}/sell-paper` | Venta manual paper (NUEVO) |
+| GET | `/stats` | KPIs agregados (acepta `?mode=paper\|live`) |
 
 ### Settings / Credentials
 
@@ -584,7 +627,7 @@ sqlite3 data/polyagent.db < migrations.sql
 | GET | `/settings/credentials` | Obtener credenciales (private key enmascarada) |
 | POST | `/settings/credentials` | Guardar private key → auto-deriva funder + API creds |
 | POST | `/settings/credentials/test` | Test de conexión CLOB API |
-| GET | `/trading-mode` | Modo actual (paper/live) |
+| GET | `/trading-mode` | Modo actual (lee de BD → env var → default paper) |
 | POST | `/orders/cancel-all` | Cancelar todas las órdenes abiertas (solo live) |
 
 ### Utilidad
@@ -603,10 +646,15 @@ Accede en `http://localhost:3000` después de ejecutar `start.sh`.
 
 | Página | Descripción |
 |--------|-------------|
-| `/dashboard` | KPIs, gráfico P&L, señales activas, control del bot |
-| `/strategies` | Cards de configuración (Bond Hunter, IFNL-Lite) |
+| `/dashboard` | KPIs, gráfico P&L, señales activas con precios en tiempo real, control del bot, toggle PAPER/LIVE |
+| `/strategies` | Cards de configuración (Bond Hunter con risk management, IFNL-Lite) |
 | `/settings` | Configurar credenciales de Polymarket (private key, auto-derive funder + API creds) |
 | `/logs` | Historial de ejecución de scans |
+
+Cada señal abierta en el dashboard muestra:
+- Precio actual, P&L si vendes ahora, P&L si esperas, coste de salir early
+- Botones **Take Profit** y **Sell** con confirmación de doble-click
+- Badge de `exit_reason` para señales cerradas por risk management (SL, TS, TIME, TP, SELL)
 
 Login: `admin@polyagent.io` / `admin`
 
@@ -678,7 +726,7 @@ Usa `bash start.sh` como entrypoint del container.
       → Seeds: Bond Hunter (enabled), IFNL-Lite (disabled)
 [3/6] Arrancar API FastAPI (uvicorn, puerto 8765)
 [4/6] Build + arrancar frontend Next.js (puerto 3000)
-[5/6] Configurar cron: */15 * * * * agent.py --mode $POLYAGENT_MODE
+[5/6] Configurar cron: */15 * * * * agent.py (modo leído de BD)
 [6/6] Auto-arrancar IFNL-Lite si enabled=1 en BD
 ```
 
@@ -749,6 +797,14 @@ python3 scripts/set_allowances.py
 
 ### Cambiar entre paper y live
 
+**Opción A — Dashboard (recomendado, sin reinicio):**
+
+En el dashboard, junto al control del bot, hay un toggle **PAPER / LIVE**. Click para cambiar. Si cambias a LIVE, se pide confirmación.
+
+El modo se guarda en la BD (`bot_status.trading_mode`). El siguiente scan del cron usa el nuevo modo automáticamente — **no requiere reinicio**.
+
+**Opción B — Variable de entorno (legacy):**
+
 Edita `.env`:
 ```env
 POLYAGENT_MODE=paper   # o live
@@ -759,7 +815,13 @@ Luego reinicia:
 bash stop.sh && bash start.sh
 ```
 
-Las señales paper y live se almacenan por separado — cambiar de modo no afecta datos históricos.
+**Prioridad de resolución del modo:**
+1. CLI `--mode` (override manual para testing)
+2. BD `bot_status.trading_mode` (toggle del dashboard)
+3. ENV `POLYAGENT_MODE` (fallback para deploy sin UI)
+4. Default: `paper`
+
+Las señales paper y live se almacenan por separado (columna `mode`) — cambiar de modo no afecta datos históricos. Stats y P&L se pueden filtrar por modo con `GET /stats?mode=paper`.
 
 ---
 

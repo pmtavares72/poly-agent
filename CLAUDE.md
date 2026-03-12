@@ -144,12 +144,17 @@ scan_interval_min        INTEGER DEFAULT 15
 updated_at               TEXT
 ```
 
-#### `signals` (Bond Hunter paper trading)
+#### `signals` (Bond Hunter paper + live trading)
 ```sql
 id, detected_at, token_id, question, market_url, closes_at, hours_to_close,
 entry_price, ask_price, spread_entry_pct, net_profit_pct, position_usdc,
 shares, protocol_fee, breakeven_price, liquidity, volume_24h, wash_score,
-outcome, resolved_at, pnl_usdc, pnl_pct, status
+outcome, resolved_at, pnl_usdc, pnl_pct, status,
+-- Risk management (Migration 006)
+stop_loss_price, highest_price_seen, trailing_stop_price,
+exit_reason, current_price, last_price_check,
+-- Live trading (Migration 004)
+mode, order_id
 ```
 
 #### `ifnl_signals` (IFNL-Lite signals)
@@ -173,7 +178,13 @@ id, proxy_wallet, market_id, timestamp, side, price, size_usd,
 mid_at_trade, mid_5m_after, mid_30m_after, mid_2h_after
 ```
 
-#### `bot_status`, `scan_log`, `runs`, `trades`
+#### `bot_status` (singleton, id=1)
+```sql
+id, enabled, pid, last_scan_at, next_scan_at, last_error, scan_count,
+trading_mode TEXT DEFAULT 'paper'  -- Migration 007: UI-controlled paper/live
+```
+
+#### `scan_log`, `runs`, `trades`
 Unchanged from original schema.
 
 ### DB Migrations
@@ -205,7 +216,10 @@ strategy.run(conn, config)
 ### Bond Hunter Core Functions (in `strategies/bond_hunter.py`)
 - `passes_basic_filters()`, `compute_wash_score()`, `kelly_size()`, `estimate_spread()`
 - `fetch_price_series()`, `fetch_open_markets()`
-- `resolve_pending_signals()`, `run_paper()`
+- `resolve_pending_signals()`, `run_paper()`, `run_live()`
+- `check_risk_exits()` — automatic stop-loss, trailing stop, time exit
+- `check_order_fills()` — verify/cancel live orders
+- `_fetch_current_price()`, `_calculate_exit_pnl()`, `_execute_risk_exit()`
 
 ---
 
@@ -224,10 +238,14 @@ FastAPI on port 8765. CORS: `allow_origins=["*"]`.
 | POST | `/bot/enable` | Enable bot |
 | POST | `/bot/disable` | Disable bot |
 | POST | `/bot/scan-now` | Trigger Bond Hunter scan |
+| **POST** | **`/bot/mode`** | **Switch paper/live mode** |
 | GET | `/signals` | Bond Hunter signals |
 | GET | `/signals/open` | Open signals |
+| **GET** | **`/signals/open/live`** | **Open signals + real-time prices + P&L** |
 | GET | `/signals/{id}` | Single signal |
-| GET | `/stats` | Aggregated stats |
+| **POST** | **`/signals/{id}/sell`** | **Manual sell (live mode)** |
+| **POST** | **`/signals/{id}/sell-paper`** | **Manual sell (paper mode)** |
+| GET | `/stats` | Aggregated stats (accepts `?mode=paper\|live`) |
 | GET | `/scan-logs` | Scan history |
 | **GET** | **`/strategies`** | **List all strategies** |
 | **GET** | **`/strategies/{slug}`** | **Strategy detail + stats** |
@@ -356,10 +374,12 @@ rewrites() {
 
 ### Key Components
 
-- **`BondHunterCard`** — Bond Hunter config with editable params, save button
+- **`BondHunterCard`** — Bond Hunter config with editable params + risk management section (stop-loss, trailing, time exit toggles/params), save button
 - **`IfnlLiteCard`** — IFNL-Lite config (5 sections: market selection, signal thresholds, position sizing, exit rules, IFS params), start/stop toggle, wallet stats
 - **`IfnlActivityPanel`** — Live engine metrics grid (in IfnlDashboard): trades captured, wallets seen, markets monitored, WebSocket status, book states, flow entries, signals generated. Shows "LIVE"/"OFFLINE" indicator + staleness detection.
 - **`BotControl`** — Start/stop bot, Scan Now button
+- **`ModeToggle`** — Paper/Live mode switch with confirmation for live mode
+- **`SignalCard`** — Open signal with real-time price, P&L scenarios, Take Profit / Sell buttons
 - **`KpiGrid`** / **`PnlChart`** / **`ActiveSignals`** / **`RecentSignalsTable`**
 - **`AppShell`** / **`Sidebar`** / **`TickerTape`**
 
@@ -369,7 +389,8 @@ rewrites() {
 useStats()           // 30s refresh → /stats
 useSignals(params)   // 30s refresh → /signals
 useOpenSignals()     // 30s refresh → /signals/open
-useBot()             // 5s refresh  → /bot
+useOpenSignalsLive() // 15s refresh → /signals/open/live (real-time prices + P&L)
+useBot()             // 5s refresh  → /bot + switchMode()
 useConfig()          // → /config + saveConfig()
 useStrategies()      // 30s refresh → /strategies
 useStrategy(slug)    // 30s refresh → /strategies/{slug}
@@ -390,7 +411,7 @@ useAuth()            // localStorage auth check
 2. Init DB: `python3 agent.py --mode paper --force` + apply `migrations.sql`
 3. Start API: `uvicorn api:app --host 0.0.0.0 --port 8765` (background)
 4. `npm install && npm run build && npm start --port 3000` (background)
-5. Add cron: `*/15 * * * * python3 agent.py --mode paper`
+5. Add cron: `*/15 * * * * python3 agent.py` (mode read from DB)
 6. Auto-start IFNL-Lite runner if `enabled=1` in DB (PID saved to `logs/ifnl_lite.pid`)
 
 ### Environment variables
