@@ -678,8 +678,15 @@ def run_paper(conn: sqlite3.Connection, config: dict):
                 skipped_quality += 1
                 continue
 
+        # Skip if we already have any position for this token (open or recent)
         cur = conn.cursor()
-        cur.execute("SELECT id FROM signals WHERE token_id=? AND status='open'", (token_id_yes,))
+        cur.execute("""
+            SELECT id FROM signals
+            WHERE token_id=? AND (
+                status='open'
+                OR detected_at > datetime('now', '-7 days')
+            )
+        """, (token_id_yes,))
         if cur.fetchone():
             continue
 
@@ -954,9 +961,18 @@ def run_live(conn: sqlite3.Connection, config: dict):
                 skipped_quality += 1
                 continue
 
-        # Check no existing open position for this token
+        # Check no existing position for this token (open OR recently placed)
+        # This prevents duplicate orders across scans.
+        # Check ANY signal for this token in the last 7 days, regardless of status —
+        # if we already bought it, don't buy again even if it was resolved/expired.
         cur = conn.cursor()
-        cur.execute("SELECT id FROM signals WHERE token_id=? AND status='open'", (token_id_yes,))
+        cur.execute("""
+            SELECT id FROM signals
+            WHERE token_id=? AND (
+                status='open'
+                OR (mode='live' AND detected_at > datetime('now', '-7 days'))
+            )
+        """, (token_id_yes,))
         if cur.fetchone():
             continue
 
@@ -990,8 +1006,8 @@ def run_live(conn: sqlite3.Connection, config: dict):
         order_price = round(ask_price, 2)
         order_size = round(shares, 2)
 
-        if order_size < 1.0:
-            continue  # Too small to place
+        if order_size < 5.0 or position_usdc < 5.0:
+            continue  # Too small — minimum $5 / 5 shares per order
 
         try:
             response = place_limit_order(
