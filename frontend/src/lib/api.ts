@@ -1,6 +1,6 @@
 import type { Stats, SignalsResponse, Signal, Run, BotConfig, BotStatus, ScanLogsResponse, StrategiesResponse, Strategy, Credentials, CredentialsSaveResponse, CredentialsTestResponse, SellResponse } from '@/types'
 
-const BASE = '/api'
+const BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`)
@@ -94,6 +94,8 @@ export const sellSignal      = (id: number, reason: string) =>
   post<SellResponse>(`/signals/${id}/sell`, { reason })
 export const sellSignalPaper = (id: number, reason: string) =>
   post<SellResponse>(`/signals/${id}/sell-paper`, { reason })
+export const claimSignal     = (id: number) =>
+  post<SellResponse>(`/signals/${id}/claim`)
 
 // Mode switching (legacy)
 export const setTradingMode = (mode: string) =>

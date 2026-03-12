@@ -585,6 +585,70 @@ def sell_signal_paper(signal_id: int, req: SellRequest):
     }
 
 
+@app.post("/signals/{signal_id}/claim")
+def claim_signal(signal_id: int):
+    """
+    Claim a position when market resolved YES (price >= 0.995).
+    Works for both paper and live modes.
+    YES tokens auto-redeem to $1.00 - no sell order needed.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM signals WHERE id=? AND status='open'", (signal_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Open signal not found")
+
+    signal = dict(row)
+    token_id = signal["token_id"]
+    shares = signal["shares"] or 0
+    position_usdc = signal["position_usdc"] or 0
+    protocol_fee = signal["protocol_fee"] or 0
+    mode = signal.get("mode", "paper")
+
+    # Verify market resolved YES
+    price = _get_cached_price(token_id)
+    if price is None:
+        conn.close()
+        raise HTTPException(status_code=502, detail="Cannot fetch current price")
+    
+    if price < 0.995:
+        conn.close()
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Market not resolved YES yet (current price: ${price:.3f}). Wait until ≥ $0.995"
+        )
+
+    # Calculate P&L: YES tokens redeem at $1.00
+    redemption_fee = shares * 1.00 * 0.001  # 0.1% redemption fee
+    pnl = (shares * 1.00 - redemption_fee) - position_usdc - protocol_fee
+    pnl_pct = (pnl / position_usdc * 100) if position_usdc else 0
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    conn.execute("""
+        UPDATE signals SET
+            status='resolved', outcome='YES', exit_reason='claim',
+            pnl_usdc=?, pnl_pct=?, resolved_at=?,
+            current_price=1.0, last_price_check=?
+        WHERE id=?
+    """, (round(pnl, 4), round(pnl_pct, 2), now_iso, now_iso, signal_id))
+    conn.commit()
+    conn.close()
+
+    return {
+        "claimed": True, 
+        "signal_id": signal_id, 
+        "outcome": "YES",
+        "redemption_price": 1.0,
+        "redemption_fee": round(redemption_fee, 4),
+        "pnl_usdc": round(pnl, 4), 
+        "pnl_pct": round(pnl_pct, 2),
+        "mode": mode,
+    }
+
+
 # ─────────────────────────────────────────────
 # STATS
 # ─────────────────────────────────────────────

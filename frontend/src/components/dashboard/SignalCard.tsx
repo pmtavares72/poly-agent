@@ -2,7 +2,7 @@
 import { useState } from 'react'
 import type { Signal } from '@/types'
 import { formatPrice, formatUSDC, formatPct, hoursUntilClose, formatHours, timeAgo } from '@/lib/format'
-import { sellSignal, sellSignalPaper } from '@/lib/api'
+import { sellSignal, sellSignalPaper, claimSignal } from '@/lib/api'
 
 interface SignalCardProps {
   signal: Signal
@@ -27,9 +27,17 @@ export function SignalCard({ signal, maxHours = 48, onSold }: SignalCardProps) {
     }
     setSelling(true)
     try {
-      const sellFn = signal.mode === 'live' ? sellSignal : sellSignalPaper
-      const result = await sellFn(signal.id, reason)
-      setSoldMsg(`${result.exit_reason === 'manual_tp' ? 'Profit taken' : 'Sold'}: ${result.pnl_usdc >= 0 ? '+' : ''}$${result.pnl_usdc.toFixed(2)}`)
+      let result: any
+      // Use claim endpoint if market resolved YES (can_claim=true)
+      if (signal.can_claim) {
+        result = await claimSignal(signal.id)
+        setSoldMsg(`Claimed: +$${result.pnl_usdc.toFixed(2)} (redeemed at $1.00)`)
+      } else {
+        // Normal sell (take profit or manual sell)
+        const sellFn = signal.mode === 'live' ? sellSignal : sellSignalPaper
+        result = await sellFn(signal.id, reason)
+        setSoldMsg(`${result.exit_reason === 'manual_tp' ? 'Profit taken' : 'Sold'}: ${result.pnl_usdc >= 0 ? '+' : ''}$${result.pnl_usdc.toFixed(2)}`)
+      }
       onSold?.()
     } catch (e) {
       setSoldMsg(`Error: ${e instanceof Error ? e.message : 'Failed'}`)

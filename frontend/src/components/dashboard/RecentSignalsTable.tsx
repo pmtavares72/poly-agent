@@ -3,7 +3,7 @@ import { useState, useMemo } from 'react'
 import type { Signal } from '@/types'
 import { Badge } from '@/components/ui/Badge'
 import { formatPrice, formatUSDC, formatPct, formatHours, hoursUntilClose, timeAgo } from '@/lib/format'
-import { sellSignal, sellSignalPaper } from '@/lib/api'
+import { sellSignal, sellSignalPaper, claimSignal } from '@/lib/api'
 
 type SortKey = 'id' | 'detected_at' | 'closes_at' | 'entry_price' | 'position_usdc' | 'net_profit_pct' | 'pnl_usdc' | 'status'
 type SortDir = 'asc' | 'desc'
@@ -78,9 +78,17 @@ function ActionButtons({ signal, onSold }: { signal: Signal; onSold?: () => void
     }
     setSelling(true)
     try {
-      const sellFn = signal.mode === 'live' ? sellSignal : sellSignalPaper
-      const res = await sellFn(signal.id, reason)
-      setResult(`${res.pnl_usdc >= 0 ? '+' : ''}$${res.pnl_usdc.toFixed(2)}`)
+      let res: any
+      // Use claim endpoint if market resolved YES (can_claim=true)
+      if (signal.can_claim) {
+        res = await claimSignal(signal.id)
+        setResult(`+$${res.pnl_usdc.toFixed(2)}`)
+      } else {
+        // Normal sell (take profit or manual sell)
+        const sellFn = signal.mode === 'live' ? sellSignal : sellSignalPaper
+        res = await sellFn(signal.id, reason)
+        setResult(`${res.pnl_usdc >= 0 ? '+' : ''}$${res.pnl_usdc.toFixed(2)}`)
+      }
       onSold?.()
     } catch (e) {
       setResult(`ERR: ${e instanceof Error ? e.message : 'Failed'}`)
