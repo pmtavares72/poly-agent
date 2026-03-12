@@ -96,7 +96,23 @@ function ActionButtons({ signal, onSold }: { signal: Signal; onSold?: () => void
 
   return (
     <div style={{ display: 'flex', gap: 4 }}>
-      {signal.can_take_profit && (
+      {signal.can_claim && (
+        <button
+          onClick={() => handleSell('take_profit')}
+          disabled={selling}
+          style={{
+            padding: '2px 8px', borderRadius: 4, border: 'none',
+            cursor: selling ? 'wait' : 'pointer',
+            fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700,
+            background: confirmAction === 'take_profit' ? '#a78bfa' : 'rgba(167,139,250,0.15)',
+            color: confirmAction === 'take_profit' ? 'var(--bg)' : '#a78bfa',
+            transition: 'all 0.15s',
+          }}
+        >
+          {selling ? '...' : confirmAction === 'take_profit' ? 'Confirm?' : 'Claim'}
+        </button>
+      )}
+      {!signal.can_claim && signal.can_take_profit && (
         <button
           onClick={() => handleSell('take_profit')}
           disabled={selling}
@@ -112,20 +128,22 @@ function ActionButtons({ signal, onSold }: { signal: Signal; onSold?: () => void
           {selling ? '...' : confirmAction === 'take_profit' ? 'Confirm?' : 'Take Profit'}
         </button>
       )}
-      <button
-        onClick={() => handleSell('manual_sell')}
-        disabled={selling}
-        style={{
-          padding: '2px 8px', borderRadius: 4, border: 'none',
-          cursor: selling ? 'wait' : 'pointer',
-          fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700,
-          background: confirmAction === 'manual_sell' ? 'var(--red)' : 'rgba(231,76,60,0.15)',
-          color: confirmAction === 'manual_sell' ? 'var(--bg)' : 'var(--red)',
-          transition: 'all 0.15s',
-        }}
-      >
-        {selling ? '...' : confirmAction === 'manual_sell' ? 'Confirm?' : 'Sell'}
-      </button>
+      {!signal.can_claim && (
+        <button
+          onClick={() => handleSell('manual_sell')}
+          disabled={selling}
+          style={{
+            padding: '2px 8px', borderRadius: 4, border: 'none',
+            cursor: selling ? 'wait' : 'pointer',
+            fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700,
+            background: confirmAction === 'manual_sell' ? 'var(--red)' : 'rgba(231,76,60,0.15)',
+            color: confirmAction === 'manual_sell' ? 'var(--bg)' : 'var(--red)',
+            transition: 'all 0.15s',
+          }}
+        >
+          {selling ? '...' : confirmAction === 'manual_sell' ? 'Confirm?' : 'Sell'}
+        </button>
+      )}
     </div>
   )
 }
@@ -174,7 +192,14 @@ function RiskRow({ signal, colSpan }: { signal: Signal; colSpan: number }) {
           {signal.stop_loss_price != null && (
             <div>
               <span style={{ color: 'var(--text3)', marginRight: 4 }}>Stop:</span>
-              <span style={{ color: 'var(--red)' }}>{formatPrice(signal.stop_loss_price)}</span>
+              <span style={{ color: 'var(--red)' }}>
+                {formatPrice(signal.stop_loss_price)}
+                {signal.pnl_at_stop != null && (
+                  <span style={{ marginLeft: 4, opacity: 0.8 }}>
+                    ({signal.pnl_at_stop >= 0 ? '+' : ''}{formatUSDC(signal.pnl_at_stop)})
+                  </span>
+                )}
+              </span>
             </div>
           )}
         </div>

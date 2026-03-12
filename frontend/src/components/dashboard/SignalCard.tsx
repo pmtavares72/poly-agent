@@ -132,7 +132,14 @@ export function SignalCard({ signal, maxHours = 48, onSold }: SignalCardProps) {
           {signal.stop_loss_price != null && (
             <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, paddingTop: 4, borderTop: '1px solid var(--border)' }}>
               <span style={{ color: 'var(--text3)' }}>Stop-loss at:</span>
-              <span style={{ color: 'var(--red)' }}>{formatPrice(signal.stop_loss_price)}</span>
+              <span style={{ color: 'var(--red)' }}>
+                {formatPrice(signal.stop_loss_price)}
+                {signal.pnl_at_stop != null && (
+                  <span style={{ marginLeft: 4, opacity: 0.8 }}>
+                    ({signal.pnl_at_stop >= 0 ? '+' : ''}{formatUSDC(signal.pnl_at_stop)})
+                  </span>
+                )}
+              </span>
             </div>
           )}
         </div>
@@ -141,7 +148,7 @@ export function SignalCard({ signal, maxHours = 48, onSold }: SignalCardProps) {
       {/* Action buttons */}
       {hasLiveData && (
         <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-          {signal.can_take_profit && (
+          {signal.can_claim ? (
             <button
               onClick={() => handleSell('take_profit')}
               disabled={selling}
@@ -149,28 +156,47 @@ export function SignalCard({ signal, maxHours = 48, onSold }: SignalCardProps) {
                 flex: 1, padding: '6px 0', borderRadius: 6,
                 border: 'none', cursor: selling ? 'wait' : 'pointer',
                 fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 600,
-                background: confirmAction === 'take_profit' ? 'var(--green)' : 'rgba(46,204,113,0.15)',
-                color: confirmAction === 'take_profit' ? 'var(--bg)' : 'var(--green)',
+                background: confirmAction === 'take_profit' ? '#a78bfa' : 'rgba(167,139,250,0.15)',
+                color: confirmAction === 'take_profit' ? 'var(--bg)' : '#a78bfa',
                 transition: 'all 0.2s',
               }}
             >
-              {selling ? 'Selling...' : confirmAction === 'take_profit' ? 'Confirm?' : 'Take Profit'}
+              {selling ? 'Claiming...' : confirmAction === 'take_profit' ? 'Confirm?' : 'Claim'}
             </button>
+          ) : (
+            <>
+              {signal.can_take_profit && (
+                <button
+                  onClick={() => handleSell('take_profit')}
+                  disabled={selling}
+                  style={{
+                    flex: 1, padding: '6px 0', borderRadius: 6,
+                    border: 'none', cursor: selling ? 'wait' : 'pointer',
+                    fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 600,
+                    background: confirmAction === 'take_profit' ? 'var(--green)' : 'rgba(46,204,113,0.15)',
+                    color: confirmAction === 'take_profit' ? 'var(--bg)' : 'var(--green)',
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  {selling ? 'Selling...' : confirmAction === 'take_profit' ? 'Confirm?' : 'Take Profit'}
+                </button>
+              )}
+              <button
+                onClick={() => handleSell('manual_sell')}
+                disabled={selling}
+                style={{
+                  flex: 1, padding: '6px 0', borderRadius: 6,
+                  border: 'none', cursor: selling ? 'wait' : 'pointer',
+                  fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 600,
+                  background: confirmAction === 'manual_sell' ? 'var(--red)' : 'rgba(231,76,60,0.15)',
+                  color: confirmAction === 'manual_sell' ? 'var(--bg)' : 'var(--red)',
+                  transition: 'all 0.2s',
+                }}
+              >
+                {selling ? 'Selling...' : confirmAction === 'manual_sell' ? 'Confirm?' : 'Sell'}
+              </button>
+            </>
           )}
-          <button
-            onClick={() => handleSell('manual_sell')}
-            disabled={selling}
-            style={{
-              flex: 1, padding: '6px 0', borderRadius: 6,
-              border: 'none', cursor: selling ? 'wait' : 'pointer',
-              fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 600,
-              background: confirmAction === 'manual_sell' ? 'var(--red)' : 'rgba(231,76,60,0.15)',
-              color: confirmAction === 'manual_sell' ? 'var(--bg)' : 'var(--red)',
-              transition: 'all 0.2s',
-            }}
-          >
-            {selling ? 'Selling...' : confirmAction === 'manual_sell' ? 'Confirm?' : 'Sell'}
-          </button>
         </div>
       )}
 

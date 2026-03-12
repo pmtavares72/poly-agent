@@ -413,12 +413,25 @@ def _compute_pnl_scenarios(signal: dict, current_price: float) -> dict:
     # Opportunity cost of selling early
     opportunity_cost = pnl_if_wait - pnl_if_sell_now
 
+    # P&L at stop-loss price (absolute loss including fees)
+    stop_loss_price = signal.get("stop_loss_price")
+    pnl_at_stop = None
+    if stop_loss_price is not None and stop_loss_price > 0:
+        stop_bid = stop_loss_price - 0.005
+        stop_sell_fee = shares * stop_bid * fee_rate
+        pnl_at_stop = (shares * stop_bid - stop_sell_fee) - position_usdc - protocol_fee
+
+    # Can claim: price >= 0.995 means market likely resolved YES
+    can_claim = current_price >= 0.995
+
     return {
         "current_price": round(current_price, 4),
         "pnl_if_sell_now": round(pnl_if_sell_now, 4),
         "pnl_if_wait": round(pnl_if_wait, 4),
         "opportunity_cost": round(opportunity_cost, 4),
         "can_take_profit": pnl_if_sell_now > 0,
+        "pnl_at_stop": round(pnl_at_stop, 4) if pnl_at_stop is not None else None,
+        "can_claim": can_claim,
     }
 
 

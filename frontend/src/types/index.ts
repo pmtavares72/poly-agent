@@ -35,6 +35,8 @@ export interface Signal {
   pnl_if_wait?: number | null
   opportunity_cost?: number | null
   can_take_profit?: boolean
+  pnl_at_stop?: number | null
+  can_claim?: boolean
 }
 
 export interface PnlPoint {
