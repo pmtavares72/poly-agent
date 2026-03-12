@@ -363,16 +363,76 @@ def kelly_size(capital: float, entry_price: float, ask_price: float,
 # SIGNAL RESOLUTION
 # ─────────────────────────────────────────────
 
+def _check_market_resolution(token_id: str) -> dict | None:
+    """
+    Query Gamma API to check if a market has OFFICIALLY resolved.
+    Returns dict with 'resolved', 'outcome' ('YES'/'NO'/None), or None on error.
+
+    A market is officially resolved when:
+      - closed == true
+      - outcomePrices[0] == "1" → YES won
+      - outcomePrices[0] == "0" → NO won
+
+    DO NOT use last-trade-price for resolution — a price of 0.93 does NOT mean
+    the market resolved YES, it just means the probability is high.
+    """
+    GAMMA_MARKET_API = "https://gamma-api.polymarket.com/markets"
+    try:
+        resp = requests.get(
+            GAMMA_MARKET_API,
+            params={"clob_token_ids": token_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        markets = resp.json()
+        if not markets:
+            return None
+
+        m = markets[0]
+        is_closed = m.get("closed", False)
+        if not is_closed:
+            return {"resolved": False, "outcome": None}
+
+        # Parse outcomePrices to determine winner
+        outcome_prices_raw = m.get("outcomePrices", "")
+        try:
+            if isinstance(outcome_prices_raw, str):
+                import json as _json
+                outcome_prices = _json.loads(outcome_prices_raw)
+            else:
+                outcome_prices = outcome_prices_raw
+        except (ValueError, TypeError):
+            return {"resolved": False, "outcome": None}
+
+        if not outcome_prices or len(outcome_prices) < 2:
+            return {"resolved": False, "outcome": None}
+
+        yes_price = float(outcome_prices[0])
+        no_price = float(outcome_prices[1])
+
+        # Only consider it resolved if outcome is definitive (1.0 or 0.0)
+        if yes_price >= 0.99:
+            return {"resolved": True, "outcome": "YES"}
+        elif no_price >= 0.99:
+            return {"resolved": True, "outcome": "NO"}
+        else:
+            # Market is closed but not yet fully resolved (still settling)
+            return {"resolved": False, "outcome": None}
+
+    except Exception:
+        return None
+
+
 def resolve_pending_signals(conn: sqlite3.Connection) -> int:
     """
-    For each 'open' signal past closes_at, queries CLOB last-trade-price
-    to determine outcome:
-      - price >= 0.9 → resolved YES (win)
-      - price <= 0.1 → resolved NO (loss)
-      - mid-range → not settled yet; expire after 6h
+    For each 'open' signal, checks the Gamma API for OFFICIAL market resolution.
+    Only marks a signal as resolved when the market has definitively closed
+    with outcomePrices showing [1,0] (YES) or [0,1] (NO).
 
-    For LIVE signals that resolve YES, auto-sells tokens at 0.99 to recover USDC
-    (Polymarket requires explicit redeem/sell — winning tokens don't auto-convert).
+    NEVER uses last-trade-price to determine outcome — that was a critical bug
+    that could mark positions as won while the market was still open.
+
+    For LIVE signals that resolve YES, auto-sells tokens at 0.99 to recover USDC.
     """
     import logging
     logger = logging.getLogger("bond_hunter.resolve")
@@ -385,7 +445,7 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
     resolved_count = 0
 
     now = datetime.now(timezone.utc)
-    console.print(f"\n[cyan]Checking {len(pending)} pending signals for resolution...[/cyan]")
+    console.print(f"\n[cyan]Checking {len(pending)} pending signals for official resolution...[/cyan]")
 
     for row in pending:
         sig_id = row["id"]
@@ -397,47 +457,40 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
         protocol_fee = row["protocol_fee"]
         mode = row["mode"] or "paper"
 
-        try:
-            closes_dt = datetime.fromisoformat(closes_at_str.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            continue
-
-        if closes_dt > now:
-            continue
-
-        hours_past = (now - closes_dt).total_seconds() / 3600
-
-        data = safe_get(CLOB_LAST_TRADE, {"token_id": token_id})
+        # Query Gamma API for official resolution status
+        resolution = _check_market_resolution(token_id)
         time.sleep(SLEEP_BETWEEN_REQUESTS)
 
-        if not data:
-            if hours_past > 6:
-                cur.execute("UPDATE signals SET status='expired' WHERE id=?", (sig_id,))
-                conn.commit()
+        if resolution is None:
+            logger.warning(f"Could not check resolution for signal #{sig_id}: {question[:40]}")
             continue
 
-        try:
-            last_price = float(data.get("price", 0))
-        except (TypeError, ValueError):
+        if not resolution["resolved"]:
+            # Market has NOT officially resolved — do nothing
+            # Expire only if way past close date and still no resolution
+            try:
+                closes_dt = datetime.fromisoformat(closes_at_str.replace("Z", "+00:00"))
+                hours_past = (now - closes_dt).total_seconds() / 3600
+                if hours_past > 72:  # 3 days past close with no resolution
+                    cur.execute("UPDATE signals SET status='expired' WHERE id=?", (sig_id,))
+                    conn.commit()
+                    logger.info(f"Expired signal #{sig_id} (72h past close, no resolution): {question[:40]}")
+            except (ValueError, TypeError):
+                pass
             continue
 
-        if last_price >= 0.9:
-            outcome = "YES"
-            # For live signals: auto-sell to recover USDC
+        # Market has OFFICIALLY resolved
+        outcome = resolution["outcome"]
+
+        if outcome == "YES":
             redeem_fee = 0.0
             if mode == "live":
                 redeem_fee = _auto_redeem(token_id, shares, question, logger)
             revenue = (shares or 0) * 1.0 - redeem_fee
             pnl = revenue - (position_usdc or 0) - (protocol_fee or 0)
-        elif last_price <= 0.1:
-            outcome = "NO"
+        else:  # NO
             revenue = 0.0
             pnl = -((position_usdc or 0) + (protocol_fee or 0))
-        else:
-            if hours_past > 6:
-                cur.execute("UPDATE signals SET status='expired' WHERE id=?", (sig_id,))
-                conn.commit()
-            continue
 
         pnl_pct = (pnl / position_usdc * 100) if position_usdc else 0
         icon = "✅" if outcome == "YES" else "❌"
@@ -446,6 +499,7 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
         pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         redeem_tag = " [bold magenta](REDEEMED)[/bold magenta]" if mode == "live" and outcome == "YES" else ""
         console.print(f"  {icon}  [bold]{q_short}[/bold]  [{color}]{pnl_str}[/{color}]  (resolved){redeem_tag}")
+        logger.info(f"Resolved #{sig_id}: {outcome} | pnl=${pnl:.2f} | {question[:40]}")
 
         cur.execute("""
             UPDATE signals SET outcome=?, resolved_at=?, pnl_usdc=?, pnl_pct=?, status='resolved'
