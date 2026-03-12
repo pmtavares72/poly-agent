@@ -381,9 +381,9 @@ rewrites() {
 - **`BondHunterCard`** — Bond Hunter config with editable params + risk management section (stop-loss, trailing, time exit toggles/params), save button
 - **`IfnlLiteCard`** — IFNL-Lite config (5 sections: market selection, signal thresholds, position sizing, exit rules, IFS params), start/stop toggle, wallet stats
 - **`IfnlActivityPanel`** — Live engine metrics grid (in IfnlDashboard): trades captured, wallets seen, markets monitored, WebSocket status, book states, flow entries, signals generated. Shows "LIVE"/"OFFLINE" indicator + staleness detection.
-- **`BotControl`** — Start/stop bot, Scan Now button
-- **`ModeToggle`** — Dual toggles: Paper ON/OFF + Live ON/OFF (independent, with confirmation for live)
-- **`SignalCard`** — Open signal with real-time price, P&L scenarios, Take Profit / Sell buttons
+- **`BotControl`** — Legacy component (exists but no longer used in dashboard)
+- **Mode control** — Inline in dashboard page: segmented Paper/Live selector + Start/Stop + Scan Now in one row
+- **`SignalCard`** — Open signal with real-time price, P&L scenarios, stop-loss with absolute loss, Claim/Take Profit/Sell buttons
 - **`KpiGrid`** / **`PnlChart`** / **`ActiveSignals`** / **`RecentSignalsTable`**
 - **`AppShell`** / **`Sidebar`** / **`TickerTape`**
 

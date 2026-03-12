@@ -362,8 +362,10 @@ Cada señal abierta en el dashboard muestra:
 - **Precio de stop-loss** — donde se vendería automáticamente
 
 Botones de acción (requieren confirmación):
+- **Claim** — Reclamar posición ganadora cuando el mercado resolvió YES (precio >= $0.995)
 - **Take Profit** — Vender al precio actual (solo visible si hay ganancia)
 - **Sell** — Vender inmediatamente para cortar pérdidas
+- **Stop-loss con pérdida absoluta** — Muestra precio de stop + la pérdida en $ que tomarías (incluyendo fees)
 
 ### Verificación de Órdenes
 
@@ -651,13 +653,15 @@ Accede en `http://localhost:3000` después de ejecutar `start.sh`.
 
 | Página | Descripción |
 |--------|-------------|
-| `/dashboard` | Tabs Paper/Live con KPIs, gráfico P&L y señales separadas. Toggles independientes Paper ON/OFF y Live ON/OFF. |
+| `/dashboard` | Segmented control Paper/Live con Start/Stop y Scan Now integrados. KPIs, gráfico P&L y señales filtradas por modo. |
 | `/strategies` | Cards de configuración (Bond Hunter con risk management, IFNL-Lite) |
 | `/settings` | Configurar credenciales de Polymarket (private key, auto-derive funder + API creds) |
 | `/logs` | Historial de ejecución de scans |
 
 Cada señal abierta en el dashboard muestra:
 - Precio actual, P&L si vendes ahora, P&L si esperas, coste de salir early
+- Precio de stop-loss con pérdida absoluta en $ (incluyendo todos los fees)
+- Botón **Claim** cuando el mercado resolvió YES (precio >= $0.995)
 - Botones **Take Profit** y **Sell** con confirmación de doble-click
 - Badge de `exit_reason` para señales cerradas por risk management (SL, TS, TIME, TP, SELL)
 
