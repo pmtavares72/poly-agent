@@ -158,7 +158,8 @@ function ActionButtons({ signal, onSold }: { signal: Signal; onSold?: () => void
 
 function RiskRow({ signal, colSpan }: { signal: Signal; colSpan: number }) {
   const hasData = signal.current_price != null && signal.current_price > 0
-  if (!hasData) return null
+  const hasStopLoss = signal.stop_loss_price != null
+  if (!hasData && !hasStopLoss) return null
 
   return (
     <tr>
@@ -169,12 +170,14 @@ function RiskRow({ signal, colSpan }: { signal: Signal; colSpan: number }) {
           padding: '8px 12px', borderRadius: 8,
           background: 'var(--bg3)',
         }}>
-          <div>
-            <span style={{ color: 'var(--text3)', marginRight: 4 }}>Current:</span>
-            <span style={{ color: signal.current_price! >= signal.entry_price ? 'var(--green)' : 'var(--red)' }}>
-              {formatPrice(signal.current_price!)}
-            </span>
-          </div>
+          {hasData && (
+            <div>
+              <span style={{ color: 'var(--text3)', marginRight: 4 }}>Current:</span>
+              <span style={{ color: signal.current_price! >= signal.entry_price ? 'var(--green)' : 'var(--red)' }}>
+                {formatPrice(signal.current_price!)}
+              </span>
+            </div>
+          )}
           {signal.pnl_if_sell_now != null && (
             <div>
               <span style={{ color: 'var(--text3)', marginRight: 4 }}>Sell now:</span>
@@ -197,17 +200,23 @@ function RiskRow({ signal, colSpan }: { signal: Signal; colSpan: number }) {
               <span style={{ color: 'var(--yellow)' }}>{formatUSDC(signal.opportunity_cost)}</span>
             </div>
           )}
-          {signal.stop_loss_price != null && (
+          {hasStopLoss && (
             <div>
               <span style={{ color: 'var(--text3)', marginRight: 4 }}>Stop:</span>
               <span style={{ color: 'var(--red)' }}>
-                {formatPrice(signal.stop_loss_price)}
+                {formatPrice(signal.stop_loss_price!)}
                 {signal.pnl_at_stop != null && (
                   <span style={{ marginLeft: 4, opacity: 0.8 }}>
                     ({signal.pnl_at_stop >= 0 ? '+' : ''}{formatUSDC(signal.pnl_at_stop)})
                   </span>
                 )}
               </span>
+            </div>
+          )}
+          {signal.trailing_stop_price != null && signal.trailing_stop_price > 0 && (
+            <div>
+              <span style={{ color: 'var(--text3)', marginRight: 4 }}>Trail:</span>
+              <span style={{ color: 'var(--yellow)' }}>{formatPrice(signal.trailing_stop_price)}</span>
             </div>
           )}
         </div>
@@ -356,7 +365,7 @@ function SignalRow({ signal: s, enriched, htc, hasActionsCol, totalCols, onSold 
           </td>
         )}
       </tr>
-      {isOpen && hasLiveData && <RiskRow signal={enriched} colSpan={totalCols} />}
+      {isOpen && <RiskRow signal={enriched} colSpan={totalCols} />}
     </>
   )
 }

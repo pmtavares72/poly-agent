@@ -137,17 +137,33 @@ export function SignalCard({ signal, maxHours = 48, onSold }: SignalCardProps) {
               {formatUSDC(signal.opportunity_cost!)}
             </span>
           </div>
-          {signal.stop_loss_price != null && (
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, paddingTop: 4, borderTop: '1px solid var(--border)' }}>
-              <span style={{ color: 'var(--text3)' }}>Stop-loss at:</span>
-              <span style={{ color: 'var(--red)' }}>
-                {formatPrice(signal.stop_loss_price)}
-                {signal.pnl_at_stop != null && (
-                  <span style={{ marginLeft: 4, opacity: 0.8 }}>
-                    ({signal.pnl_at_stop >= 0 ? '+' : ''}{formatUSDC(signal.pnl_at_stop)})
-                  </span>
-                )}
-              </span>
+        </div>
+      )}
+
+      {/* Stop-loss info (always shown when configured, even without live price) */}
+      {signal.stop_loss_price != null && (
+        <div style={{
+          marginTop: hasLiveData && signal.pnl_if_sell_now != null ? 0 : 10,
+          padding: '8px 10px',
+          background: 'var(--bg3)', borderRadius: 8,
+          fontFamily: 'var(--mono)', fontSize: 10,
+          ...(hasLiveData && signal.pnl_if_sell_now != null ? { borderTop: '1px solid var(--border)', borderRadius: '0 0 8px 8px' } : {}),
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text3)' }}>Stop-loss at:</span>
+            <span style={{ color: 'var(--red)' }}>
+              {formatPrice(signal.stop_loss_price)}
+              {signal.pnl_at_stop != null && (
+                <span style={{ marginLeft: 4, opacity: 0.8 }}>
+                  ({signal.pnl_at_stop >= 0 ? '+' : ''}{formatUSDC(signal.pnl_at_stop)})
+                </span>
+              )}
+            </span>
+          </div>
+          {signal.trailing_stop_price != null && signal.trailing_stop_price > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+              <span style={{ color: 'var(--text3)' }}>Trailing stop:</span>
+              <span style={{ color: 'var(--yellow)' }}>{formatPrice(signal.trailing_stop_price)}</span>
             </div>
           )}
         </div>
