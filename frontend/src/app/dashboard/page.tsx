@@ -6,7 +6,6 @@ import { KpiGrid } from '@/components/dashboard/KpiGrid'
 import { ActiveSignals } from '@/components/dashboard/ActiveSignals'
 import { RecentSignalsTable } from '@/components/dashboard/RecentSignalsTable'
 import { BotControl } from '@/components/dashboard/BotControl'
-import { ModeToggle } from '@/components/dashboard/ModeToggle'
 import { IfnlDashboard } from '@/components/dashboard/IfnlDashboard'
 import { useStats } from '@/hooks/useStats'
 import { useSignals, useOpenSignalsLive } from '@/hooks/useSignals'
@@ -29,13 +28,103 @@ function Skeleton({ h = 160 }: { h?: number }) {
 type StrategyTab = 'bond_hunter' | 'ifnl_lite'
 type ModeTab = 'paper' | 'live'
 
+function ModeStartStop({ mode, enabled, onToggle, disabled }: {
+  mode: ModeTab
+  enabled: boolean
+  onToggle: (enabled: boolean) => Promise<void>
+  disabled: boolean
+}) {
+  const [confirming, setConfirming] = useState(false)
+  const isLive = mode === 'live'
+  const color = isLive ? 'var(--red)' : 'var(--yellow)'
+  const label = mode.toUpperCase()
+
+  async function handleClick() {
+    if (!enabled && isLive) {
+      // Enabling live requires confirmation
+      if (!confirming) {
+        setConfirming(true)
+        setTimeout(() => setConfirming(false), 4000)
+        return
+      }
+      setConfirming(false)
+    }
+    await onToggle(!enabled)
+  }
+
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 12,
+      padding: '12px 16px', borderRadius: 10,
+      background: enabled ? `${color}08` : 'var(--surface)',
+      border: `1px solid ${enabled ? color : 'var(--border)'}`,
+      marginBottom: 20,
+      transition: 'all 0.2s',
+    }}>
+      <div style={{ position: 'relative', flexShrink: 0 }}>
+        <div style={{
+          width: 36, height: 36, borderRadius: '50%',
+          background: enabled ? `${color}20` : 'var(--surface2)',
+          border: `1px solid ${enabled ? `${color}40` : 'var(--border2)'}`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 16,
+        }}>
+          {enabled ? '◈' : '◉'}
+        </div>
+        <div style={{
+          position: 'absolute', bottom: -1, right: -1,
+          width: 10, height: 10, borderRadius: '50%',
+          background: enabled ? color : 'var(--text3)',
+          border: '2px solid var(--bg)',
+          boxShadow: enabled ? `0 0 6px ${color}` : 'none',
+        }} />
+      </div>
+
+      <div style={{ flex: 1 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 12, fontWeight: 700, color: enabled ? color : 'var(--text3)' }}>
+            {label} TRADING
+          </span>
+          <span style={{
+            fontFamily: 'var(--mono)', fontSize: 9, padding: '2px 6px', borderRadius: 4,
+            background: enabled ? `${color}20` : 'var(--surface2)',
+            color: enabled ? color : 'var(--text3)',
+            letterSpacing: '0.08em',
+          }}>
+            {enabled ? 'ACTIVE' : 'STOPPED'}
+          </span>
+        </div>
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text3)', marginTop: 2 }}>
+          {isLive ? 'Real orders on Polymarket CLOB' : 'Simulated trades with real market data'}
+        </div>
+      </div>
+
+      <button
+        onClick={handleClick}
+        disabled={disabled}
+        style={{
+          padding: '8px 18px', borderRadius: 8,
+          background: confirming ? color : enabled ? 'rgba(231,76,60,0.12)' : `${color}`,
+          color: confirming ? '#000' : enabled ? 'var(--red)' : '#000',
+          border: enabled ? '1px solid rgba(231,76,60,0.3)' : 'none',
+          fontFamily: 'var(--sans)', fontSize: 12, fontWeight: 700,
+          cursor: disabled ? 'not-allowed' : 'pointer',
+          letterSpacing: '0.04em', transition: 'all 0.2s',
+          opacity: disabled ? 0.5 : 1,
+          boxShadow: !enabled && !confirming ? `0 0 16px ${color}40` : 'none',
+        }}
+      >
+        {disabled ? '...' : confirming ? 'Confirm Live?' : enabled ? '⏹ Stop' : '▶ Start'}
+      </button>
+    </div>
+  )
+}
+
 export default function DashboardPage() {
   const [strategyTab, setStrategyTab] = useState<StrategyTab>('bond_hunter')
   const [modeTab, setModeTab] = useState<ModeTab>('paper')
 
   const { bot, togglePaper, toggleLive, actionLoading: modeLoading } = useBot()
-  // paper_enabled/live_enabled may not exist if migration 008 hasn't been applied yet
-  // Default: paper ON if field missing, live ON if old trading_mode was 'live'
   const paperEnabled = bot?.paper_enabled != null ? !!(bot.paper_enabled) : true
   const liveEnabled = bot?.live_enabled != null ? !!(bot.live_enabled) : bot?.trading_mode === 'live'
 
@@ -98,21 +187,12 @@ export default function DashboardPage() {
       {/* Bond Hunter Tab */}
       {strategyTab === 'bond_hunter' && (
         <>
-          {/* Controls row: Bot + Mode toggles */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
-            <div style={{ flex: 1 }}><BotControl /></div>
-            <ModeToggle
-              paperEnabled={paperEnabled}
-              liveEnabled={liveEnabled}
-              onTogglePaper={togglePaper}
-              onToggleLive={toggleLive}
-              disabled={modeLoading}
-            />
-          </div>
+          {/* Global bot status + Scan Now */}
+          <BotControl />
 
           {/* Paper / Live sub-tabs */}
           <div style={{
-            display: 'flex', gap: 0, marginBottom: 20,
+            display: 'flex', gap: 0, marginBottom: 16,
           }}>
             {modeTabs.map(tab => {
               const isActive = modeTab === tab.key
@@ -141,15 +221,21 @@ export default function DashboardPage() {
                     marginRight: 6,
                   }} />
                   {tab.label.toUpperCase()}
-                  <span style={{
-                    fontSize: 9, marginLeft: 6, opacity: 0.6,
-                  }}>
+                  <span style={{ fontSize: 9, marginLeft: 6, opacity: 0.6 }}>
                     {tab.enabled ? 'ON' : 'OFF'}
                   </span>
                 </button>
               )
             })}
           </div>
+
+          {/* Mode-specific Start/Stop control */}
+          <ModeStartStop
+            mode={modeTab}
+            enabled={modeTab === 'paper' ? paperEnabled : liveEnabled}
+            onToggle={modeTab === 'paper' ? togglePaper : toggleLive}
+            disabled={modeLoading}
+          />
 
           {/* Dashboard content filtered by modeTab */}
           {statsLoading || !stats ? (
