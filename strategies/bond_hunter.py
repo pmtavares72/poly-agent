@@ -370,9 +370,15 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
       - price >= 0.9 → resolved YES (win)
       - price <= 0.1 → resolved NO (loss)
       - mid-range → not settled yet; expire after 6h
+
+    For LIVE signals that resolve YES, auto-sells tokens at 0.99 to recover USDC
+    (Polymarket requires explicit redeem/sell — winning tokens don't auto-convert).
     """
+    import logging
+    logger = logging.getLogger("bond_hunter.resolve")
+
     cur = conn.cursor()
-    cur.execute("SELECT id, token_id, question, closes_at, position_usdc, shares, protocol_fee FROM signals WHERE status='open'")
+    cur.execute("SELECT id, token_id, question, closes_at, position_usdc, shares, protocol_fee, mode FROM signals WHERE status='open'")
     pending = cur.fetchall()
     if not pending:
         return 0
@@ -389,6 +395,7 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
         position_usdc = row["position_usdc"]
         shares = row["shares"]
         protocol_fee = row["protocol_fee"]
+        mode = row["mode"] or "paper"
 
         try:
             closes_dt = datetime.fromisoformat(closes_at_str.replace("Z", "+00:00"))
@@ -416,7 +423,11 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
 
         if last_price >= 0.9:
             outcome = "YES"
-            revenue = (shares or 0) * 1.0
+            # For live signals: auto-sell to recover USDC
+            redeem_fee = 0.0
+            if mode == "live":
+                redeem_fee = _auto_redeem(token_id, shares, question, logger)
+            revenue = (shares or 0) * 1.0 - redeem_fee
             pnl = revenue - (position_usdc or 0) - (protocol_fee or 0)
         elif last_price <= 0.1:
             outcome = "NO"
@@ -433,7 +444,8 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
         q_short = (question[:50] + "…") if question and len(question) > 50 else question
         color = "green" if pnl >= 0 else "red"
         pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-        console.print(f"  {icon}  [bold]{q_short}[/bold]  [{color}]{pnl_str}[/{color}]  (resolved)")
+        redeem_tag = " [bold magenta](REDEEMED)[/bold magenta]" if mode == "live" and outcome == "YES" else ""
+        console.print(f"  {icon}  [bold]{q_short}[/bold]  [{color}]{pnl_str}[/{color}]  (resolved){redeem_tag}")
 
         cur.execute("""
             UPDATE signals SET outcome=?, resolved_at=?, pnl_usdc=?, pnl_pct=?, status='resolved'
@@ -443,6 +455,32 @@ def resolve_pending_signals(conn: sqlite3.Connection) -> int:
         resolved_count += 1
 
     return resolved_count
+
+
+def _auto_redeem(token_id: str, shares: float, question: str, logger) -> float:
+    """
+    Auto-redeem a winning live position by selling tokens at 0.99.
+    Returns the redeem cost (shares * 0.01) on success, 0.0 on failure.
+    The caller deducts this from revenue.
+    """
+    try:
+        from clob_client import sell_position
+        sell_size = round(shares, 2)
+        if sell_size < 1.0:
+            logger.info(f"Redeem skip (too small): {sell_size} shares for {question[:40]}")
+            return 0.0
+
+        response = sell_position(token_id=token_id, size=sell_size, price=0.99)
+        order_id = response.get("orderID") or response.get("id") or "unknown"
+        logger.info(f"Auto-redeem OK: {question[:40]} | {sell_size} shares | order={order_id}")
+        console.print(f"    [magenta]💰 Auto-redeem: sold {sell_size} shares @ 0.99 → order {order_id}[/magenta]")
+        # Cost of selling at 0.99 instead of 1.00
+        return shares * 0.01
+    except Exception as e:
+        logger.error(f"Auto-redeem FAILED: {question[:40]} | {shares} shares | {e}")
+        console.print(f"    [red]⚠ Auto-redeem failed: {e}[/red]")
+        console.print(f"    [red]  Manual claim needed for {token_id}[/red]")
+        return 0.0
 
 
 # ─────────────────────────────────────────────

@@ -15,7 +15,7 @@ import logging
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, ApiCreds
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.order_builder.constants import BUY, SELL
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,45 @@ def place_limit_order(token_id: str, price: float, size: float) -> dict:
         return response
 
     # If response is a string (order ID), wrap it
+    return {"orderID": str(response), "success": True}
+
+
+def sell_position(token_id: str, size: float, price: float = 0.99) -> dict:
+    """
+    Sell YES tokens to cash out a winning position.
+    Used for auto-redeem: after market resolves YES, sell at ~0.99 to recover USDC.
+
+    Args:
+        token_id: The YES outcome token ID
+        size: Number of tokens to sell
+        price: Sell price (default 0.99 — fills instantly post-resolution)
+
+    Returns:
+        dict with order response
+
+    Raises:
+        RuntimeError on failure
+    """
+    client = get_clob_client()
+
+    order_args = OrderArgs(
+        token_id=token_id,
+        price=price,
+        size=size,
+        side=SELL,
+    )
+
+    signed_order = client.create_order(order_args)
+    response = client.post_order(signed_order, OrderType.GTC)
+
+    if not response:
+        raise RuntimeError(f"Empty response from CLOB for sell on {token_id}")
+
+    if isinstance(response, dict):
+        if response.get("errorMsg"):
+            raise RuntimeError(f"Sell rejected: {response['errorMsg']}")
+        return response
+
     return {"orderID": str(response), "success": True}
 
 
