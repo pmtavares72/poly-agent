@@ -5,11 +5,11 @@ import { AppShell } from '@/components/layout/AppShell'
 import { KpiGrid } from '@/components/dashboard/KpiGrid'
 import { ActiveSignals } from '@/components/dashboard/ActiveSignals'
 import { RecentSignalsTable } from '@/components/dashboard/RecentSignalsTable'
-import { BotControl } from '@/components/dashboard/BotControl'
 import { IfnlDashboard } from '@/components/dashboard/IfnlDashboard'
 import { useStats } from '@/hooks/useStats'
 import { useSignals, useOpenSignalsLive } from '@/hooks/useSignals'
 import { useBot } from '@/hooks/useBot'
+import { timeAgo } from '@/lib/format'
 
 const PnlChart = dynamic(
   () => import('@/components/dashboard/PnlChart').then(m => ({ default: m.PnlChart })),
@@ -28,107 +28,20 @@ function Skeleton({ h = 160 }: { h?: number }) {
 type StrategyTab = 'bond_hunter' | 'ifnl_lite'
 type ModeTab = 'paper' | 'live'
 
-function ModeStartStop({ mode, enabled, onToggle, disabled }: {
-  mode: ModeTab
-  enabled: boolean
-  onToggle: (enabled: boolean) => Promise<void>
-  disabled: boolean
-}) {
-  const [confirming, setConfirming] = useState(false)
-  const isLive = mode === 'live'
-  const color = isLive ? 'var(--red)' : 'var(--yellow)'
-  const label = mode.toUpperCase()
-
-  async function handleClick() {
-    if (!enabled && isLive) {
-      // Enabling live requires confirmation
-      if (!confirming) {
-        setConfirming(true)
-        setTimeout(() => setConfirming(false), 4000)
-        return
-      }
-      setConfirming(false)
-    }
-    await onToggle(!enabled)
-  }
-
-  return (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 12,
-      padding: '12px 16px', borderRadius: 10,
-      background: enabled ? `${color}08` : 'var(--surface)',
-      border: `1px solid ${enabled ? color : 'var(--border)'}`,
-      marginBottom: 20,
-      transition: 'all 0.2s',
-    }}>
-      <div style={{ position: 'relative', flexShrink: 0 }}>
-        <div style={{
-          width: 36, height: 36, borderRadius: '50%',
-          background: enabled ? `${color}20` : 'var(--surface2)',
-          border: `1px solid ${enabled ? `${color}40` : 'var(--border2)'}`,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 16,
-        }}>
-          {enabled ? '◈' : '◉'}
-        </div>
-        <div style={{
-          position: 'absolute', bottom: -1, right: -1,
-          width: 10, height: 10, borderRadius: '50%',
-          background: enabled ? color : 'var(--text3)',
-          border: '2px solid var(--bg)',
-          boxShadow: enabled ? `0 0 6px ${color}` : 'none',
-        }} />
-      </div>
-
-      <div style={{ flex: 1 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 12, fontWeight: 700, color: enabled ? color : 'var(--text3)' }}>
-            {label} TRADING
-          </span>
-          <span style={{
-            fontFamily: 'var(--mono)', fontSize: 9, padding: '2px 6px', borderRadius: 4,
-            background: enabled ? `${color}20` : 'var(--surface2)',
-            color: enabled ? color : 'var(--text3)',
-            letterSpacing: '0.08em',
-          }}>
-            {enabled ? 'ACTIVE' : 'STOPPED'}
-          </span>
-        </div>
-        <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text3)', marginTop: 2 }}>
-          {isLive ? 'Real orders on Polymarket CLOB' : 'Simulated trades with real market data'}
-        </div>
-      </div>
-
-      <button
-        onClick={handleClick}
-        disabled={disabled}
-        style={{
-          padding: '8px 18px', borderRadius: 8,
-          background: confirming ? color : enabled ? 'rgba(231,76,60,0.12)' : `${color}`,
-          color: confirming ? '#000' : enabled ? 'var(--red)' : '#000',
-          border: enabled ? '1px solid rgba(231,76,60,0.3)' : 'none',
-          fontFamily: 'var(--sans)', fontSize: 12, fontWeight: 700,
-          cursor: disabled ? 'not-allowed' : 'pointer',
-          letterSpacing: '0.04em', transition: 'all 0.2s',
-          opacity: disabled ? 0.5 : 1,
-          boxShadow: !enabled && !confirming ? `0 0 16px ${color}40` : 'none',
-        }}
-      >
-        {disabled ? '...' : confirming ? 'Confirm Live?' : enabled ? '⏹ Stop' : '▶ Start'}
-      </button>
-    </div>
-  )
-}
-
 export default function DashboardPage() {
   const [strategyTab, setStrategyTab] = useState<StrategyTab>('bond_hunter')
   const [modeTab, setModeTab] = useState<ModeTab>('paper')
+  const [confirming, setConfirming] = useState(false)
+  const [scanMsg, setScanMsg] = useState<string | null>(null)
 
-  const { bot, togglePaper, toggleLive, actionLoading: modeLoading } = useBot()
+  const { bot, togglePaper, toggleLive, triggerScan, actionLoading } = useBot()
   const paperEnabled = bot?.paper_enabled != null ? !!(bot.paper_enabled) : true
   const liveEnabled = bot?.live_enabled != null ? !!(bot.live_enabled) : bot?.trading_mode === 'live'
+  const scanning = Boolean(bot?.pid_alive)
 
-  // Data filtered by the active mode tab
+  const modeEnabled = modeTab === 'paper' ? paperEnabled : liveEnabled
+  const modeColor = modeTab === 'live' ? 'var(--red)' : 'var(--yellow)'
+
   const { stats, isLoading: statsLoading } = useStats(modeTab)
   const { signals: openSignals, mutate: mutateOpen } = useOpenSignalsLive(modeTab)
   const { signals: recentSignals } = useSignals({ limit: 20, mode: modeTab })
@@ -138,16 +51,31 @@ export default function DashboardPage() {
     { key: 'ifnl_lite', label: 'IFNL-Lite', type: 'continuous', color: '#a78bfa' },
   ]
 
-  const modeTabs: { key: ModeTab; label: string; color: string; enabled: boolean }[] = [
-    { key: 'paper', label: 'Paper', color: 'var(--yellow)', enabled: paperEnabled },
-    { key: 'live', label: 'Live', color: 'var(--red)', enabled: liveEnabled },
-  ]
+  async function handleToggle() {
+    if (!modeEnabled && modeTab === 'live') {
+      if (!confirming) {
+        setConfirming(true)
+        setTimeout(() => setConfirming(false), 4000)
+        return
+      }
+      setConfirming(false)
+    }
+    const fn = modeTab === 'paper' ? togglePaper : toggleLive
+    await fn(!modeEnabled)
+  }
+
+  async function handleScan() {
+    setScanMsg(null)
+    await triggerScan()
+    setScanMsg('Scan triggered')
+    setTimeout(() => setScanMsg(null), 8000)
+  }
 
   return (
     <AppShell activePage="dashboard" title="Dashboard">
       {/* Strategy Tabs */}
       <div style={{
-        display: 'flex', gap: 4, marginBottom: 16,
+        display: 'flex', gap: 4, marginBottom: 20,
         borderBottom: '1px solid var(--border)',
         paddingBottom: 0,
       }}>
@@ -187,55 +115,103 @@ export default function DashboardPage() {
       {/* Bond Hunter Tab */}
       {strategyTab === 'bond_hunter' && (
         <>
-          {/* Global bot status + Scan Now */}
-          <BotControl />
-
-          {/* Paper / Live sub-tabs */}
+          {/* Mode selector + controls */}
           <div style={{
-            display: 'flex', gap: 0, marginBottom: 16,
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            marginBottom: 24, gap: 16, flexWrap: 'wrap',
           }}>
-            {modeTabs.map(tab => {
-              const isActive = modeTab === tab.key
-              return (
+            {/* Left: segmented control */}
+            <div style={{
+              display: 'inline-flex',
+              background: 'var(--bg2)',
+              borderRadius: 10,
+              padding: 3,
+              border: '1px solid var(--border)',
+            }}>
+              {(['paper', 'live'] as ModeTab[]).map(m => {
+                const isActive = modeTab === m
+                const c = m === 'live' ? 'var(--red)' : 'var(--yellow)'
+                const en = m === 'paper' ? paperEnabled : liveEnabled
+                return (
+                  <button
+                    key={m}
+                    onClick={() => { setModeTab(m); setConfirming(false) }}
+                    style={{
+                      position: 'relative',
+                      padding: '7px 22px',
+                      background: isActive ? 'var(--surface2)' : 'transparent',
+                      border: 'none',
+                      borderRadius: 8,
+                      color: isActive ? 'var(--text)' : 'var(--text3)',
+                      fontFamily: 'var(--mono)', fontSize: 11, fontWeight: 600,
+                      cursor: 'pointer', transition: 'all 0.2s', letterSpacing: '0.08em',
+                    }}
+                  >
+                    <span style={{
+                      display: 'inline-block', width: 5, height: 5, borderRadius: '50%',
+                      background: en ? c : 'var(--text3)', opacity: en ? 1 : 0.3,
+                      marginRight: 7, verticalAlign: 'middle',
+                      boxShadow: en && isActive ? `0 0 6px ${c}` : 'none',
+                      transition: 'all 0.3s',
+                    }} />
+                    {m.toUpperCase()}
+                  </button>
+                )
+              })}
+            </div>
+
+            {/* Center: status */}
+            <div style={{
+              flex: 1, minWidth: 0,
+              fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text3)',
+              textAlign: 'center',
+            }}>
+              {scanMsg
+                ? <span style={{ color: 'var(--green)' }}>{scanMsg}</span>
+                : bot?.last_error
+                  ? <span style={{ color: 'var(--red)' }}>{bot.last_error}</span>
+                  : bot?.last_scan_at
+                    ? <>{timeAgo(bot.last_scan_at)} · {bot.scan_count} scans</>
+                    : null
+              }
+            </div>
+
+            {/* Right: actions */}
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>
+              {modeEnabled && (
                 <button
-                  key={tab.key}
-                  onClick={() => setModeTab(tab.key)}
+                  onClick={handleScan}
+                  disabled={actionLoading || scanning}
                   style={{
-                    padding: '8px 20px',
-                    background: isActive ? `${tab.color}12` : 'transparent',
-                    border: `1px solid ${isActive ? tab.color : 'var(--border)'}`,
-                    borderRadius: tab.key === 'paper' ? '8px 0 0 8px' : '0 8px 8px 0',
-                    color: isActive ? tab.color : 'var(--text3)',
-                    fontFamily: 'var(--mono)',
-                    fontSize: 11,
-                    fontWeight: isActive ? 700 : 400,
-                    cursor: 'pointer',
+                    padding: '6px 14px', borderRadius: 7,
+                    background: 'transparent',
+                    color: actionLoading || scanning ? 'var(--text3)' : 'var(--cyan)',
+                    border: '1px solid rgba(0,194,255,0.2)',
+                    fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '0.04em',
+                    cursor: actionLoading || scanning ? 'default' : 'pointer',
                     transition: 'all 0.2s',
-                    letterSpacing: '0.06em',
                   }}
                 >
-                  <span style={{
-                    display: 'inline-block', width: 6, height: 6, borderRadius: '50%',
-                    background: tab.enabled ? tab.color : 'var(--text3)',
-                    opacity: tab.enabled ? 1 : 0.3,
-                    marginRight: 6,
-                  }} />
-                  {tab.label.toUpperCase()}
-                  <span style={{ fontSize: 9, marginLeft: 6, opacity: 0.6 }}>
-                    {tab.enabled ? 'ON' : 'OFF'}
-                  </span>
+                  {scanning ? '...' : 'Scan Now'}
                 </button>
-              )
-            })}
+              )}
+              <button
+                onClick={handleToggle}
+                disabled={actionLoading}
+                style={{
+                  padding: '6px 16px', borderRadius: 7,
+                  background: confirming ? modeColor : modeEnabled ? 'transparent' : modeColor,
+                  color: confirming ? '#000' : modeEnabled ? modeColor : '#000',
+                  border: `1px solid ${confirming ? 'transparent' : modeEnabled ? modeColor : 'transparent'}`,
+                  fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 700, letterSpacing: '0.04em',
+                  cursor: actionLoading ? 'not-allowed' : 'pointer',
+                  transition: 'all 0.2s', opacity: actionLoading ? 0.5 : 1,
+                }}
+              >
+                {actionLoading ? '...' : confirming ? 'Confirm?' : modeEnabled ? 'Stop' : 'Start'}
+              </button>
+            </div>
           </div>
-
-          {/* Mode-specific Start/Stop control */}
-          <ModeStartStop
-            mode={modeTab}
-            enabled={modeTab === 'paper' ? paperEnabled : liveEnabled}
-            onToggle={modeTab === 'paper' ? togglePaper : toggleLive}
-            disabled={modeLoading}
-          />
 
           {/* Dashboard content filtered by modeTab */}
           {statsLoading || !stats ? (
